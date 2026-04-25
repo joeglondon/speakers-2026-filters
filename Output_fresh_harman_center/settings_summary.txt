@@ -1,0 +1,29 @@
+miniDSP 2x4 HD settings summary
+
+Routing:
+Left: Input 1
+Right: Input 2
+Sub: Input 1 + Input 2
+
+Crossover: LR4 / 24 dB/oct at 50.0 Hz
+Sub high-pass: none requested; no protective HPF inserted
+
+Output trims:
+Left: delay 5.750 ms, gain +0.143 dB
+Right: delay 5.750 ms, gain +0.142 dB
+Sub: delay 0.000 ms, gain -2.424 dB
+
+FIR imports:
+Left: fir_left_96k_1022taps.bin / fir_left_96k_1022taps_manual.txt
+Right: fir_right_96k_1022taps.bin / fir_right_96k_1022taps_manual.txt
+Sub: fir_sub_96k_2040taps.bin / fir_sub_96k_2040taps_manual.txt
+
+PEQ imports:
+Left: peq_left.txt
+Right: peq_right.txt
+Sub: peq_sub.txt
+
+Crossover advanced-mode imports:
+Left: crossover_left.txt
+Right: crossover_right.txt
+Sub: crossover_sub.txt

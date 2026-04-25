@@ -1,0 +1,40 @@
+miniDSP 2x4 HD settings summary
+
+Routing:
+Left: Input 1
+Right: Input 2
+Sub: Input 1 + Input 2
+
+Crossover: LR4 / 24 dB/oct at 140 Hz
+Sub high-pass: none
+Sub correction lower limit: 15 Hz
+
+Output trims:
+Left: delay 7.102 ms, gain -2.975 dB
+Right: delay 7.102 ms, gain -3.827 dB
+Sub: delay 0.000 ms, gain -4.101 dB
+
+FIR group delay compensation:
+Sub FIR group delay is 10.620 ms.
+Left/Right FIR group delay is 5.318 ms.
+The output delays above include this difference.
+
+FIR imports:
+File Mode binary:
+Left: fir_left_96k_1022taps.bin
+Right: fir_right_96k_1022taps.bin
+Sub: fir_sub_96k_2040taps.bin
+Manual Mode text:
+Left: fir_left_96k_1022taps_manual.txt
+Right: fir_right_96k_1022taps_manual.txt
+Sub: fir_sub_96k_2040taps_manual.txt
+
+PEQ imports:
+Left: peq_left.txt
+Right: peq_right.txt
+Sub: peq_sub.txt
+
+Crossover advanced-mode imports, if you do not use Basic LR4 controls:
+Left: crossover_left.txt
+Right: crossover_right.txt
+Sub: crossover_sub.txt
