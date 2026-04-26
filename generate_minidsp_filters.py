@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """Generate miniDSP-style PEQ, crossover, delay, gain, and FIR files.
 
-The script is intentionally self-contained and only depends on NumPy so it can
-run in the bundled Codex Python runtime. It reads the REW text exports in the
-SPL and Impulse folders, averages the repeated measurements, optimizes the
-subwoofer crossover alignment, and writes a reproducible Output folder.
+The script depends on NumPy for DSP/FIR math and SciPy for bounded PEQ
+least-squares refinement. It reads the REW text exports in the SPL and Impulse
+folders, averages the repeated measurements, optimizes the subwoofer crossover
+alignment, and writes a reproducible Output folder.
 """
 
 from __future__ import annotations
@@ -99,6 +99,10 @@ class ChannelResult:
     rms_after_db: float
     max_boost_db: float
     max_cut_db: float
+    rms_after_peq_db: float = 0.0
+    fir_requested_method: str = "legacy"
+    fir_used_method: str = "legacy"
+    fir_metrics: Dict[str, float] | None = None
 
 
 @dataclass
@@ -376,6 +380,26 @@ def rms(values: np.ndarray) -> float:
     return float(np.sqrt(np.mean(np.square(values)))) if values.size else float("nan")
 
 
+def boost_cap_curve_db(
+    freq: np.ndarray,
+    distortion: Dict[str, np.ndarray] | None,
+    channel_key: str,
+    default_boost_db: float,
+    no_boost_below_hz: float = 25.0,
+) -> np.ndarray:
+    cap = np.full(freq.shape, float(default_boost_db), dtype=np.float64)
+    if channel_key == "sub":
+        cap[freq < no_boost_below_hz] = 0.0
+    if channel_key == "sub" and distortion is not None and "freq" in distortion and "thd_pct" in distortion:
+        d_freq = np.asarray(distortion["freq"], dtype=np.float64)
+        thd = np.asarray(distortion["thd_pct"], dtype=np.float64)
+        if d_freq.size and thd.size:
+            thd_on_grid = np.interp(freq, d_freq, thd, left=thd[0], right=thd[-1])
+            thd_factor = 1.0 - np.clip((thd_on_grid - 5.0) / 5.0, 0.0, 1.0)
+            cap = np.minimum(cap, float(default_boost_db) * thd_factor)
+    return np.maximum(cap, 0.0)
+
+
 def smooth_log(values: np.ndarray, freq: np.ndarray, width_oct: float = 1 / 6) -> np.ndarray:
     values = np.asarray(values, dtype=np.float64)
     freq = np.asarray(freq, dtype=np.float64)
@@ -454,6 +478,59 @@ def cascade_response(filters: Sequence[Biquad], freq: np.ndarray, fs: float = OU
         if filt.enabled:
             response *= filt.response(freq, fs)
     return response
+
+
+def limit_peak_gain_to_boost_cap(
+    freq: np.ndarray,
+    existing_filters: Sequence[Biquad],
+    centre: float,
+    gain_db: float,
+    q: float,
+    boost_cap_db: np.ndarray,
+    fs: float = OUT_FS,
+) -> float:
+    if gain_db <= 0.0:
+        return gain_db
+    existing = cascade_response(existing_filters, freq, fs)
+
+    def max_over_cap(candidate_gain: float) -> float:
+        candidate = biquad_peak(centre, candidate_gain, q, fs)
+        boost_db = db(existing * candidate.response(freq, fs))
+        return float(np.max(boost_db - boost_cap_db))
+
+    cap_tolerance_db = 0.0
+    if max_over_cap(gain_db) <= cap_tolerance_db:
+        return gain_db
+    lo = 0.0
+    hi = gain_db
+    for _ in range(40):
+        mid = 0.5 * (lo + hi)
+        if max_over_cap(mid) <= cap_tolerance_db:
+            lo = mid
+        else:
+            hi = mid
+    return lo
+
+
+def limit_peak_filters_to_boost_cap(
+    filters: Sequence[Biquad],
+    freq: np.ndarray,
+    boost_cap_db: np.ndarray,
+    fs: float = OUT_FS,
+) -> List[Biquad]:
+    capped_filters: List[Biquad] = []
+    for filt in filters:
+        gain = limit_peak_gain_to_boost_cap(
+            freq,
+            capped_filters,
+            filt.freq,
+            filt.gain_db,
+            filt.q,
+            boost_cap_db,
+            fs,
+        )
+        capped_filters.append(biquad_peak(filt.freq, gain, filt.q, fs))
+    return capped_filters
 
 
 def lr4_filters(freq_hz: float, kind: str) -> List[Biquad]:
@@ -612,10 +689,16 @@ def seed_peak_filters(
     target_db: np.ndarray,
     correction_mask: np.ndarray,
     max_filters: int = MAX_PEQ_FILTERS,
+    boost_cap_db: np.ndarray | None = None,
 ) -> List[Biquad]:
     filters: List[Biquad] = []
     current = response.copy()
     used_ranges: List[Tuple[float, float]] = []
+    boost_cap = (
+        np.asarray(boost_cap_db, dtype=np.float64)
+        if boost_cap_db is not None
+        else np.full(freq.shape, 3.0, dtype=np.float64)
+    )
 
     for _ in range(max_filters):
         error = db(current) - target_db
@@ -624,7 +707,7 @@ def seed_peak_filters(
         cut_idx = int(np.argmax(masked))
         cut_amount = masked[cut_idx]
 
-        dip = np.where(correction_mask, -smooth_error, 0.0)
+        dip = np.where(correction_mask & (boost_cap > 1e-6), -smooth_error, 0.0)
         boost_idx = int(np.argmax(dip))
         boost_amount = dip[boost_idx]
 
@@ -634,7 +717,7 @@ def seed_peak_filters(
         elif boost_amount >= 2.0:
             idx = boost_idx
             # Boost gently and avoid trying to fill nulls.
-            gain = float(np.clip(boost_amount * 0.35, 0.5, 3.0))
+            gain = float(np.clip(boost_amount * 0.35, 0.5, min(3.0, boost_cap[idx])))
         else:
             break
 
@@ -664,6 +747,11 @@ def seed_peak_filters(
         high_f = min(float(freq[high_idx]), centre * 3.0)
         bandwidth_oct = max(math.log2(high_f / low_f), 0.15)
         q = float(np.clip(1.0 / bandwidth_oct, 0.35, 8.0))
+        if gain > 0.0 and boost_cap_db is not None:
+            gain = limit_peak_gain_to_boost_cap(freq, filters, centre, gain, q, boost_cap)
+            if gain < 0.1:
+                used_ranges.append((centre / (2.0 ** 0.2), centre * (2.0 ** 0.2)))
+                continue
         filt = biquad_peak(centre, gain, q)
         if not filt.is_stable():
             break
@@ -685,6 +773,17 @@ def _require_least_squares():
     return least_squares
 
 
+def _require_minimize():
+    try:
+        from scipy.optimize import minimize
+    except ImportError as exc:
+        raise RuntimeError(
+            "SciPy is required for gain refinement. "
+            "Install dependencies with: python3 -m pip install -r requirements.txt"
+        ) from exc
+    return minimize
+
+
 def _peq_rms_error(
     filters: Sequence[Biquad],
     freq: np.ndarray,
@@ -695,6 +794,63 @@ def _peq_rms_error(
     return rms(corrected_db - target_db)
 
 
+def prune_redundant_peq_filters(
+    filters: Sequence[Biquad],
+    freq: np.ndarray,
+    response: np.ndarray,
+    target_db: np.ndarray,
+    correction_mask: np.ndarray,
+    max_rms_worsening_db: float = 0.2,
+    same_sign_octaves: float = 1.0 / 3.0,
+    fs: float = OUT_FS,
+) -> List[Biquad]:
+    remaining = [filt for filt in filters if filt.is_stable()]
+    mask = correction_mask.astype(bool)
+    if len(remaining) < 2 or np.count_nonzero(mask) < 3:
+        return remaining
+
+    fit_freq = freq[mask]
+    base = response[mask]
+    fit_target = target_db[mask]
+
+    def fit_rms(candidate_filters: Sequence[Biquad]) -> float:
+        corrected = base * cascade_response(candidate_filters, fit_freq, fs)
+        return rms(db(corrected) - fit_target)
+
+    def impact(candidate_filters: Sequence[Biquad], idx: int) -> float:
+        with_filter = fit_rms(candidate_filters)
+        without_filter = fit_rms(candidate_filters[:idx] + candidate_filters[idx + 1 :])
+        return without_filter - with_filter
+
+    changed = True
+    while changed:
+        changed = False
+        current_rms = fit_rms(remaining)
+        best_remove: int | None = None
+        best_worsening = float("inf")
+        for left_idx, left in enumerate(remaining):
+            for right_idx in range(left_idx + 1, len(remaining)):
+                right = remaining[right_idx]
+                if left.gain_db * right.gain_db <= 0.0:
+                    continue
+                spacing_oct = abs(math.log2(left.freq / right.freq))
+                if spacing_oct > same_sign_octaves:
+                    continue
+                left_impact = impact(remaining, left_idx)
+                right_impact = impact(remaining, right_idx)
+                candidate_idx = left_idx if left_impact <= right_impact else right_idx
+                candidate = remaining[:candidate_idx] + remaining[candidate_idx + 1 :]
+                worsening = fit_rms(candidate) - current_rms
+                if worsening <= max_rms_worsening_db and worsening < best_worsening:
+                    best_remove = candidate_idx
+                    best_worsening = worsening
+        if best_remove is not None:
+            remaining.pop(best_remove)
+            changed = True
+
+    return remaining
+
+
 def optimize_peak_filters(
     freq: np.ndarray,
     response: np.ndarray,
@@ -702,6 +858,9 @@ def optimize_peak_filters(
     correction_mask: np.ndarray,
     seed_filters: Sequence[Biquad],
     distortion: Dict[str, np.ndarray] | None = None,
+    boost_cap_db: np.ndarray | None = None,
+    boost_cap_penalty_weight: float = 8.0,
+    peq_cumulative_boost_cap_db: float = 5.0,
     fs: float = OUT_FS,
 ) -> PeqOptimizationResult:
     """Refine all PEQ parameters together with bounded robust least squares."""
@@ -722,6 +881,18 @@ def optimize_peak_filters(
     fit_grid = np.geomspace(lo_freq, hi_freq, grid_points)
     base_db = np.interp(fit_grid, freq, db(response))
     fit_target_db = np.interp(fit_grid, freq, target_db)
+    boost_cap_grid_db = (
+        np.interp(fit_grid, freq, np.asarray(boost_cap_db, dtype=np.float64))
+        if boost_cap_db is not None
+        else None
+    )
+    cumulative_boost_cap_grid_db = np.full(
+        fit_grid.shape,
+        float(peq_cumulative_boost_cap_db),
+        dtype=np.float64,
+    )
+    if boost_cap_grid_db is not None:
+        cumulative_boost_cap_grid_db = np.minimum(cumulative_boost_cap_grid_db, boost_cap_grid_db)
 
     q_min, q_max = 0.35, 8.0
     gain_min, gain_max = -9.0, 3.0
@@ -738,6 +909,11 @@ def optimize_peak_filters(
         clipped_freq = float(np.clip(filt.freq, lo_freq, hi_freq))
         clipped_q = float(np.clip(filt.q, q_min, q_max))
         filter_gain_max = gain_max
+        if boost_cap_db is not None:
+            filter_gain_max = min(
+                filter_gain_max,
+                float(np.interp(clipped_freq, freq, np.asarray(boost_cap_db, dtype=np.float64))),
+            )
         if distortion_freq is not None and distortion_thd is not None and clipped_freq < 25.0:
             thd = float(
                 np.interp(
@@ -764,7 +940,31 @@ def optimize_peak_filters(
             filters.append(biquad_peak(centre, gain, q, fs))
         return filters
 
-    seed_for_fallback = decode(np.asarray(x0, dtype=np.float64))
+    cumulative_boost_cap_full = np.full(
+        freq.shape,
+        float(peq_cumulative_boost_cap_db),
+        dtype=np.float64,
+    )
+    if boost_cap_db is not None:
+        cumulative_boost_cap_full = np.minimum(
+            cumulative_boost_cap_full,
+            np.asarray(boost_cap_db, dtype=np.float64),
+        )
+    seed_for_fallback = limit_peak_filters_to_boost_cap(
+        decode(np.asarray(x0, dtype=np.float64)),
+        freq,
+        cumulative_boost_cap_full,
+        fs,
+    )
+    seed_for_fallback = prune_redundant_peq_filters(
+        seed_for_fallback,
+        freq,
+        response,
+        target_db,
+        correction_mask,
+        max_rms_worsening_db=0.2,
+        fs=fs,
+    )
     seed_rms = _peq_rms_error(seed_for_fallback, fit_grid, base_db, fit_target_db)
 
     def penalty_residuals(filters: Sequence[Biquad]) -> List[float]:
@@ -786,10 +986,18 @@ def optimize_peak_filters(
                 low_freq_risk = max(0.0, (25.0 - filt.freq) / 10.0)
                 thd_risk = max(0.0, (thd - 5.0) / 5.0)
                 penalties.append(boost * low_freq_risk * thd_risk * 6.0)
+        if boost_cap_grid_db is not None:
+            peq_boost_db = db(cascade_response(filters, fit_grid, fs))
+            over_boost = np.maximum(peq_boost_db - boost_cap_grid_db, 0.0)
+            penalties.extend((over_boost * boost_cap_penalty_weight).tolist())
+        peq_boost_db = db(cascade_response(filters, fit_grid, fs))
+        over_cumulative_boost = np.maximum(peq_boost_db - cumulative_boost_cap_grid_db, 0.0)
+        penalties.extend((over_cumulative_boost * 3.0).tolist())
         for left_idx, left in enumerate(filters):
             for right in filters[left_idx + 1 :]:
                 spacing_oct = abs(math.log2(left.freq / right.freq))
-                penalties.append(max((1.0 / 3.0) - spacing_oct, 0.0) * 3.0)
+                same_sign = 1.0 if left.gain_db * right.gain_db > 0.0 else 0.35
+                penalties.append(max((1.0 / 3.0) - spacing_oct, 0.0) * 3.0 * same_sign)
         return penalties
 
     def residuals(params: np.ndarray) -> np.ndarray:
@@ -806,13 +1014,39 @@ def optimize_peak_filters(
         f_scale=1.5,
         max_nfev=900,
     )
-    all_filters = [filt for filt in decode(result.x) if abs(filt.gain_db) >= 0.1]
+    decoded_filters = decode(result.x)
+    if peq_cumulative_boost_cap_db > 0.0:
+        decoded_filters = limit_peak_filters_to_boost_cap(
+            decoded_filters,
+            freq,
+            cumulative_boost_cap_full,
+            fs,
+        )
+    all_filters = [filt for filt in decoded_filters if abs(filt.gain_db) >= 0.1]
     stable_filters = [filt for filt in all_filters if filt.is_stable()]
+    stable_filters = prune_redundant_peq_filters(
+        stable_filters,
+        freq,
+        response,
+        target_db,
+        correction_mask,
+        max_rms_worsening_db=0.2,
+        fs=fs,
+    )
     refined_rms = _peq_rms_error(stable_filters, fit_grid, base_db, fit_target_db)
     if not stable_filters and seed_filters:
         refined_rms = rms(base_db - fit_target_db)
     if not np.isfinite(refined_rms) or refined_rms > seed_rms:
         stable_filters = seed_for_fallback
+        stable_filters = prune_redundant_peq_filters(
+            stable_filters,
+            freq,
+            response,
+            target_db,
+            correction_mask,
+            max_rms_worsening_db=0.2,
+            fs=fs,
+        )
         refined_rms = seed_rms
     accepted = bool(result.success) or bool(np.isfinite(refined_rms) and refined_rms <= seed_rms)
     return PeqOptimizationResult(
@@ -847,6 +1081,11 @@ def peq_optimization_metadata(result: PeqOptimizationResult) -> Dict[str, object
             "gain_db": [-9.0, 3.0],
             "frequency_hz": "channel correction mask",
         },
+        "cumulative_boost_cap_db": 5.0,
+        "redundant_filter_pruning": {
+            "same_sign_octaves": 1.0 / 3.0,
+            "max_rms_worsening_db": 0.2,
+        },
         "seed_rms_db": result.seed_rms_db,
         "refined_rms_db": result.refined_rms_db,
         "success": result.success,
@@ -861,13 +1100,21 @@ def make_fir(
     taps: int,
     correction_mask: np.ndarray,
     fs: float = OUT_FS,
+    boost_cap_db: np.ndarray | None = None,
+    max_cut_db: float = 10.0,
 ) -> np.ndarray:
     nfft = 65536
     grid = np.linspace(0.0, fs / 2.0, nfft // 2 + 1)
     safe_residual = np.zeros_like(freq)
     safe_residual[correction_mask] = residual_db[correction_mask]
     safe_residual = smooth_log(safe_residual, np.maximum(freq, 1.0), width_oct=1 / 3)
-    safe_residual = np.clip(safe_residual, -10.0, 3.0)
+    boost_cap = (
+        np.asarray(boost_cap_db, dtype=np.float64)
+        if boost_cap_db is not None
+        else np.full(freq.shape, 3.0, dtype=np.float64)
+    )
+    safe_residual = np.maximum(safe_residual, -float(max_cut_db))
+    safe_residual = np.minimum(safe_residual, boost_cap)
 
     interp_db = np.interp(grid, freq, safe_residual, left=0.0, right=0.0)
     # Blend correction to flat at the correction band edges to reduce ripple.
@@ -958,37 +1205,26 @@ def make_fir_ls(
     lambda_reg: float = 0.01,
     max_boost_db: float = 3.0,
     max_cut_db: float = 10.0,
+    boost_cap_db: np.ndarray | None = None,
+    phase_mode: str = "magnitude",
 ) -> np.ndarray:
-    if taps <= 0:
-        raise ValueError("FIR tap count must be positive")
     if lambda_reg < 0.0:
         raise ValueError("--fir-ls-lambda must be non-negative")
-    if max_boost_db < 0.0 or max_cut_db < 0.0:
-        raise ValueError("FIR boost/cut guardrails must be non-negative")
-
-    design_freq = design_fir_frequency_grid(freq, correction_mask, fs=fs, grid_points=grid_points)
-    measured = interp_complex(freq, measured_response, design_freq)
-    target = np.interp(design_freq, freq, target_db, left=target_db[0], right=target_db[-1])
-    active = np.interp(design_freq, freq, correction_mask.astype(np.float64), left=0.0, right=0.0) >= 0.5
-
-    measured_db = db(measured)
-    correction_db = np.clip(target - measured_db, -max_cut_db, max_boost_db)
-    desired_active_db = measured_db + correction_db
-    delay_samples = (taps - 1) / 2.0
-    delay_phase = np.exp(-1j * 2.0 * np.pi * design_freq * (delay_samples / fs))
-
-    desired = measured * delay_phase
-    desired[active] = (10.0 ** (desired_active_db[active] / 20.0)) * delay_phase[active]
-
-    confidence = np.ones_like(design_freq, dtype=np.float64) * 0.08
-    confidence[active] = 1.0
-    confidence *= np.clip(np.abs(measured) / np.percentile(np.abs(measured), 75), 0.1, 1.0)
-    weights = np.sqrt(confidence)
-
+    design_freq, correction_target, weights = ls_fir_correction_target(
+        freq,
+        measured_response,
+        target_db,
+        taps,
+        correction_mask,
+        fs=fs,
+        grid_points=grid_points,
+        max_boost_db=max_boost_db,
+        max_cut_db=max_cut_db,
+        boost_cap_db=boost_cap_db,
+        phase_mode=phase_mode,
+    )
     n = np.arange(taps, dtype=np.float64)
     fourier = np.exp(-1j * 2.0 * np.pi * np.outer(design_freq / fs, n))
-    safe_measured = np.where(np.abs(measured) > EPS, measured, EPS + 0.0j)
-    correction_target = desired / safe_measured
     system = fourier * weights[:, None]
     weighted_target = correction_target * weights
     fir = solve_real_complex_lstsq(
@@ -1000,9 +1236,152 @@ def make_fir_ls(
 
     return fir.astype(np.float64)
 
+
+def ls_fir_correction_target(
+    freq: np.ndarray,
+    measured_response: np.ndarray,
+    target_db: np.ndarray,
+    taps: int,
+    correction_mask: np.ndarray,
+    fs: float = OUT_FS,
+    grid_points: int = 1024,
+    max_boost_db: float = 3.0,
+    max_cut_db: float = 10.0,
+    boost_cap_db: np.ndarray | None = None,
+    phase_mode: str = "magnitude",
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    if taps <= 0:
+        raise ValueError("FIR tap count must be positive")
+    if max_boost_db < 0.0 or max_cut_db < 0.0:
+        raise ValueError("FIR boost/cut guardrails must be non-negative")
+    if phase_mode not in {"magnitude", "complex-inverse"}:
+        raise ValueError("--fir-ls-phase-mode must be 'magnitude' or 'complex-inverse'")
+
+    design_freq = design_fir_frequency_grid(freq, correction_mask, fs=fs, grid_points=grid_points)
+    measured = interp_complex(freq, measured_response, design_freq)
+    target = np.interp(design_freq, freq, target_db, left=target_db[0], right=target_db[-1])
+    active = np.interp(design_freq, freq, correction_mask.astype(np.float64), left=0.0, right=0.0) >= 0.5
+
+    measured_db = db(measured)
+    boost_cap_design = (
+        np.interp(design_freq, freq, np.asarray(boost_cap_db, dtype=np.float64))
+        if boost_cap_db is not None
+        else np.full(design_freq.shape, float(max_boost_db), dtype=np.float64)
+    )
+    correction_db = np.maximum(target - measured_db, -max_cut_db)
+    correction_db = np.minimum(correction_db, boost_cap_design)
+    correction_db[~active] = 0.0
+    desired_active_db = measured_db + correction_db
+    delay_samples = (taps - 1) / 2.0
+    delay_phase = np.exp(-1j * 2.0 * np.pi * design_freq * (delay_samples / fs))
+
+    confidence = np.ones_like(design_freq, dtype=np.float64) * 0.08
+    confidence[active] = 1.0
+    confidence *= np.clip(np.abs(measured) / np.percentile(np.abs(measured), 75), 0.1, 1.0)
+    confidence[boost_cap_design <= 0.1] *= 25.0
+    weights = np.sqrt(confidence)
+
+    if phase_mode == "magnitude":
+        correction_mag = 10.0 ** (correction_db / 20.0)
+        correction_target = correction_mag * delay_phase
+    else:
+        desired = measured * delay_phase
+        desired[active] = (10.0 ** (desired_active_db[active] / 20.0)) * delay_phase[active]
+        safe_measured = np.where(np.abs(measured) > EPS, measured, EPS + 0.0j)
+        correction_target = desired / safe_measured
+    return design_freq, correction_target, weights
+
 def fir_response(fir: np.ndarray, freq: np.ndarray, fs: float = OUT_FS) -> np.ndarray:
     n = np.arange(fir.size)
     return np.exp(-1j * 2.0 * np.pi * np.outer(freq / fs, n)) @ fir
+
+
+def channel_rms_error(
+    response: np.ndarray,
+    target_db: np.ndarray,
+    mask: np.ndarray,
+) -> float:
+    return rms(db(response[mask]) - target_db[mask])
+
+
+def choose_fir_with_fallback(
+    freq: np.ndarray,
+    after_peq: np.ndarray,
+    target_db: np.ndarray,
+    correction_mask: np.ndarray,
+    requested_method: str,
+    fallback_enabled: bool,
+    ls_fir: np.ndarray | None,
+    legacy_fir: np.ndarray,
+    guardrail_fir: np.ndarray | None = None,
+    fallback_tolerance_db: float = 0.25,
+    boost_cap_db: np.ndarray | None = None,
+    peq_response: np.ndarray | None = None,
+) -> Dict[str, object]:
+    after_peq_rms = channel_rms_error(after_peq, target_db, correction_mask)
+    legacy_response = after_peq * fir_response(legacy_fir, freq)
+    legacy_rms = channel_rms_error(legacy_response, target_db, correction_mask)
+    peq_filter_response = peq_response if peq_response is not None else np.ones_like(freq, dtype=np.complex128)
+    legacy_filter_boost = db(peq_filter_response * fir_response(legacy_fir, freq))
+    legacy_boost_over_cap = (
+        float(np.max(legacy_filter_boost - boost_cap_db))
+        if boost_cap_db is not None
+        else 0.0
+    )
+    metrics = {
+        "after_peq_rms_db": after_peq_rms,
+        "legacy_rms_db": legacy_rms,
+        "legacy_boost_over_cap_db": legacy_boost_over_cap,
+    }
+    if requested_method == "legacy" or ls_fir is None:
+        return {
+            "fir": legacy_fir,
+            "used_method": "legacy",
+            "metrics": metrics,
+        }
+
+    ls_response = after_peq * fir_response(ls_fir, freq)
+    ls_rms = channel_rms_error(ls_response, target_db, correction_mask)
+    ls_filter_boost = db(peq_filter_response * fir_response(ls_fir, freq))
+    ls_boost_over_cap = (
+        float(np.max(ls_filter_boost - boost_cap_db))
+        if boost_cap_db is not None
+        else 0.0
+    )
+    metrics["ls_rms_db"] = ls_rms
+    metrics["ls_boost_over_cap_db"] = ls_boost_over_cap
+    if fallback_enabled and not (
+        ls_rms < after_peq_rms and ls_rms <= legacy_rms + fallback_tolerance_db
+        and ls_boost_over_cap <= 0.1
+    ):
+        if boost_cap_db is not None and legacy_boost_over_cap > 0.1 and guardrail_fir is not None:
+            guardrail_response = after_peq * fir_response(guardrail_fir, freq)
+            guardrail_filter_boost = db(peq_filter_response * fir_response(guardrail_fir, freq))
+            guardrail_boost_over_cap = float(np.max(guardrail_filter_boost - boost_cap_db))
+            metrics["guardrail_rms_db"] = channel_rms_error(guardrail_response, target_db, correction_mask)
+            metrics["guardrail_boost_over_cap_db"] = guardrail_boost_over_cap
+            if guardrail_boost_over_cap <= 0.1:
+                return {
+                    "fir": guardrail_fir,
+                    "used_method": "flat guardrail fallback",
+                    "metrics": metrics,
+                }
+        return {
+            "fir": legacy_fir,
+            "used_method": "legacy fallback",
+            "metrics": metrics,
+        }
+    return {
+        "fir": ls_fir,
+        "used_method": "ls",
+        "metrics": metrics,
+    }
+
+
+def flat_delay_fir(taps: int) -> np.ndarray:
+    fir = np.zeros(taps, dtype=np.float64)
+    fir[taps // 2] = 1.0
+    return fir
 
 
 def fir_group_delay_ms(taps: int, fs: float = OUT_FS) -> float:
@@ -1122,6 +1501,101 @@ def score_final_system_candidate(
     }
 
 
+def apply_gain_deltas(
+    final_channels: Dict[str, np.ndarray],
+    deltas_db: Dict[str, float],
+) -> Dict[str, np.ndarray]:
+    return {
+        key: final_channels[key] * (10.0 ** (deltas_db.get(key, 0.0) / 20.0))
+        for key in final_channels
+    }
+
+
+def refine_output_gains(
+    freq: np.ndarray,
+    final_channels: Dict[str, np.ndarray],
+    lsum_measured: np.ndarray,
+    rsum_measured: np.ndarray,
+    target_db: np.ndarray,
+    crossover_hz: float,
+    seed_gains_db: Dict[str, float],
+    crossover_preference_hz: float | None = None,
+    max_delta_db: float = 3.0,
+) -> Dict[str, object]:
+    minimize = _require_minimize()
+    channels = ("left", "right", "sub")
+    zero = {key: 0.0 for key in channels}
+    score_before = score_final_system_candidate(
+        freq,
+        final_channels,
+        lsum_measured,
+        rsum_measured,
+        target_db,
+        crossover_hz,
+        crossover_preference_hz,
+    )
+
+    def objective(deltas: np.ndarray) -> float:
+        delta_map = {key: float(deltas[idx]) for idx, key in enumerate(channels)}
+        scored_channels = apply_gain_deltas(final_channels, delta_map)
+        return score_final_system_candidate(
+            freq,
+            scored_channels,
+            lsum_measured,
+            rsum_measured,
+            target_db,
+            crossover_hz,
+            crossover_preference_hz,
+        )["score"]
+
+    result = minimize(
+        objective,
+        np.zeros(3, dtype=np.float64),
+        method="L-BFGS-B",
+        bounds=[(-max_delta_db, max_delta_db)] * 3,
+        options={"maxiter": 80, "ftol": 1e-7},
+    )
+    deltas = np.asarray(result.x if result.success else np.zeros(3), dtype=np.float64)
+    deltas = np.clip(deltas, -max_delta_db, max_delta_db)
+    delta_db = {key: float(deltas[idx]) for idx, key in enumerate(channels)}
+    refined_channels = apply_gain_deltas(final_channels, delta_db)
+    score_after = score_final_system_candidate(
+        freq,
+        refined_channels,
+        lsum_measured,
+        rsum_measured,
+        target_db,
+        crossover_hz,
+        crossover_preference_hz,
+    )
+    if score_after["score"] > score_before["score"]:
+        delta_db = zero
+        refined_channels = final_channels
+        score_after = score_before
+    return {
+        "enabled": True,
+        "gain_seed_db": dict(seed_gains_db),
+        "gain_delta_db": delta_db,
+        "gain_final_db": {
+            key: float(seed_gains_db[key] + delta_db[key])
+            for key in channels
+        },
+        "final_channels": refined_channels,
+        "score_before": score_before,
+        "score_after": score_after,
+        "optimizer_success": bool(result.success),
+        "optimizer_message": str(result.message),
+    }
+
+
+def gain_refinement_metadata(refinement: Dict[str, object]) -> Dict[str, object]:
+    return {
+        key: value
+        for key, value in refinement.items()
+        if key != "final_channels"
+    }
+
+
 def select_exact_crossover_candidate(
     candidates: Sequence[Dict[str, float]],
     exact_scorer,
@@ -1153,7 +1627,28 @@ def select_exact_crossover_candidate(
 
     best = dict(min(exact_rows, key=lambda row: row["exact_score"]))
     best["top_candidates"] = sorted(exact_rows, key=lambda row: row["exact_score"])
+    best["exact_candidate_limit"] = int(max_candidates)
+    best["exact_candidates_scored"] = len(exact_rows)
     return best
+
+
+def crossover_selection_metadata(crossover: Dict[str, float]) -> Dict[str, object]:
+    exact_rows = list(crossover.get("top_candidates", []))
+    selected_keys = (
+        "crossover_hz",
+        "sub_delay_ms",
+        "sub_gain_db",
+        "proxy_score",
+        "exact_score",
+        "score",
+    )
+    selected = {key: crossover[key] for key in selected_keys if key in crossover}
+    return {
+        "exact_candidate_limit": int(crossover.get("exact_candidate_limit", len(exact_rows))),
+        "exact_candidates_scored": int(crossover.get("exact_candidates_scored", len(exact_rows))),
+        "selected_candidate": selected,
+        "exact_scored_candidates": exact_rows,
+    }
 
 
 def correction_masks(
@@ -1179,6 +1674,10 @@ def build_final_filter_system(
     fir_ls_lambda: float = 0.01,
     fir_ls_max_boost_db: float = 3.0,
     fir_ls_max_cut_db: float = 10.0,
+    fir_ls_phase_mode: str = "magnitude",
+    fir_ls_fallback: str = "on",
+    gain_refinement_enabled: bool = True,
+    crossover_preference_hz: float | None = None,
 ) -> Dict[str, object]:
     fc = float(crossover["crossover_hz"])
     masks = correction_masks(freq, fc, sub_low_freq=sub_low_freq)
@@ -1193,63 +1692,176 @@ def build_final_filter_system(
         sub_taps=FIR_TAPS["sub"],
         fs=OUT_FS,
     )
-    gains = {
+    seed_gains = {
         "left": choose_channel_gain(freq, avg["left"] * hp, target_db, masks["left"]),
         "right": choose_channel_gain(freq, avg["right"] * hp, target_db, masks["right"]),
         "sub": float(crossover["sub_gain_db"])
         + choose_channel_gain(freq, avg["sub"] * lp * sub_hp, target_db, masks["sub"], headroom_db=-3.0),
     }
 
-    results: List[ChannelResult] = []
-    corrected: Dict[str, np.ndarray] = {}
-    final_channels: Dict[str, np.ndarray] = {}
-    for key, title in [("left", "Left"), ("right", "Right"), ("sub", "Sub")]:
-        base = avg[key] * xover[key] * 10.0 ** (gains[key] / 20.0)
-        seed = seed_peak_filters(freq, base, target_db, masks[key], MAX_PEQ_FILTERS)
-        peq_result = optimize_peak_filters(freq, base, target_db, masks[key], seed, distortion)
-        peq = peq_result.filters
-        peq_resp = cascade_response(peq, freq)
-        after_peq = base * peq_resp
-        residual = target_db - db(after_peq)
-        if fir_method == "ls":
-            fir = make_fir_ls(
+    def build_with_gains(current_gains: Dict[str, float]) -> Dict[str, object]:
+        results: List[ChannelResult] = []
+        corrected: Dict[str, np.ndarray] = {}
+        final_channels: Dict[str, np.ndarray] = {}
+        for key, title in [("left", "Left"), ("right", "Right"), ("sub", "Sub")]:
+            base = avg[key] * xover[key] * 10.0 ** (current_gains[key] / 20.0)
+            peq_boost_cap = boost_cap_curve_db(freq, distortion, key, default_boost_db=3.0)
+            fir_boost_cap = boost_cap_curve_db(
+                freq,
+                distortion,
+                key,
+                default_boost_db=fir_ls_max_boost_db if fir_method == "ls" else 3.0,
+            )
+            seed = seed_peak_filters(
+                freq,
+                base,
+                target_db,
+                masks[key],
+                MAX_PEQ_FILTERS,
+                boost_cap_db=peq_boost_cap,
+            )
+            peq_result = optimize_peak_filters(
+                freq,
+                base,
+                target_db,
+                masks[key],
+                seed,
+                distortion,
+                boost_cap_db=peq_boost_cap,
+            )
+            peq = peq_result.filters
+            peq_resp = cascade_response(peq, freq)
+            after_peq = base * peq_resp
+            residual = target_db - db(after_peq)
+            legacy_fir = make_fir(
+                freq,
+                residual,
+                FIR_TAPS[key],
+                masks[key],
+                boost_cap_db=fir_boost_cap,
+                max_cut_db=fir_ls_max_cut_db,
+            )
+            ls_fir = None
+            if fir_method == "ls":
+                ls_fir = make_fir_ls(
+                    freq,
+                    after_peq,
+                    target_db,
+                    FIR_TAPS[key],
+                    masks[key],
+                    grid_points=fir_ls_grid_points,
+                    lambda_reg=fir_ls_lambda,
+                    max_boost_db=fir_ls_max_boost_db,
+                    max_cut_db=fir_ls_max_cut_db,
+                    boost_cap_db=fir_boost_cap,
+                    phase_mode=fir_ls_phase_mode,
+                )
+            elif fir_method != "legacy":
+                raise ValueError(f"Unsupported FIR method: {fir_method}")
+
+            selected_fir = choose_fir_with_fallback(
                 freq,
                 after_peq,
                 target_db,
-                FIR_TAPS[key],
                 masks[key],
-                grid_points=fir_ls_grid_points,
-                lambda_reg=fir_ls_lambda,
-                max_boost_db=fir_ls_max_boost_db,
-                max_cut_db=fir_ls_max_cut_db,
+                requested_method=fir_method,
+                fallback_enabled=fir_ls_fallback == "on",
+                ls_fir=ls_fir,
+                legacy_fir=legacy_fir,
+                guardrail_fir=flat_delay_fir(FIR_TAPS[key]),
+                boost_cap_db=fir_boost_cap if key == "sub" else None,
+                peq_response=peq_resp,
             )
-        elif fir_method == "legacy":
-            fir = make_fir(freq, residual, FIR_TAPS[key], masks[key])
-        else:
-            raise ValueError(f"Unsupported FIR method: {fir_method}")
-        f_resp = fir_response(fir, freq)
-        after_all = after_peq * f_resp
-        corrected[key] = after_all
-        final_channels[key] = apply_output_delay(after_all, freq, delays[key])
-        max_boost, max_cut = summarize_filters(peq)
-        before_err = db(base[masks[key]]) - target_db[masks[key]]
-        after_err = db(after_all[masks[key]]) - target_db[masks[key]]
-        results.append(
-            ChannelResult(
-                key=key,
-                title=title,
-                peq=peq,
-                peq_optimization=peq_optimization_metadata(peq_result),
-                fir=fir,
-                gain_db=gains[key],
-                delay_ms=delays[key],
-                fir_taps=FIR_TAPS[key],
-                rms_before_db=rms(before_err),
-                rms_after_db=rms(after_err),
-                max_boost_db=max_boost,
-                max_cut_db=max_cut,
+            fir = selected_fir["fir"]  # type: ignore[assignment]
+            f_resp = fir_response(fir, freq)
+            after_all = after_peq * f_resp
+            corrected[key] = after_all
+            final_channels[key] = apply_output_delay(after_all, freq, delays[key])
+            max_boost, max_cut = summarize_filters(peq)
+            before_err = db(base[masks[key]]) - target_db[masks[key]]
+            after_err = db(after_all[masks[key]]) - target_db[masks[key]]
+            results.append(
+                ChannelResult(
+                    key=key,
+                    title=title,
+                    peq=peq,
+                    peq_optimization=peq_optimization_metadata(peq_result),
+                    fir=fir,
+                    gain_db=current_gains[key],
+                    delay_ms=delays[key],
+                    fir_taps=FIR_TAPS[key],
+                    rms_before_db=rms(before_err),
+                    rms_after_db=rms(after_err),
+                    max_boost_db=max_boost,
+                    max_cut_db=max_cut,
+                    rms_after_peq_db=channel_rms_error(after_peq, target_db, masks[key]),
+                    fir_requested_method=fir_method,
+                    fir_used_method=str(selected_fir["used_method"]),
+                    fir_metrics=selected_fir["metrics"],  # type: ignore[arg-type]
+                )
             )
+        return {
+            "results": results,
+            "corrected": corrected,
+            "final_channels": final_channels,
+            "gains": dict(current_gains),
+        }
+
+    def apply_gain_refinement(build: Dict[str, object], refinement: Dict[str, object]) -> Dict[str, object]:
+        gain_delta = refinement["gain_delta_db"]  # type: ignore[assignment]
+        final_gains = refinement["gain_final_db"]  # type: ignore[assignment]
+        corrected_with_gains = apply_gain_deltas(build["corrected"], gain_delta)  # type: ignore[arg-type]
+        final_with_gains = refinement["final_channels"]
+        results_with_gains = build["results"]  # type: ignore[assignment]
+        for result in results_with_gains:
+            result.gain_db = float(final_gains[result.key])
+            result.rms_after_db = channel_rms_error(corrected_with_gains[result.key], target_db, masks[result.key])
+        return {
+            **build,
+            "gains": final_gains,
+            "corrected": corrected_with_gains,
+            "final_channels": final_with_gains,
+            "results": results_with_gains,
+        }
+
+    built = build_with_gains(seed_gains)
+    gain_refinement = {
+        "enabled": False,
+        "gain_seed_db": dict(seed_gains),
+        "gain_delta_db": {"left": 0.0, "right": 0.0, "sub": 0.0},
+        "gain_final_db": dict(seed_gains),
+        "score_before": {},
+        "score_after": {},
+        "rebuilt_after_large_delta": False,
+    }
+    if gain_refinement_enabled:
+        gain_refinement = refine_output_gains(
+            freq,
+            built["final_channels"],  # type: ignore[arg-type]
+            avg["left_sum"],
+            avg["right_sum"],
+            target_db,
+            fc,
+            seed_gains,
+            crossover_preference_hz=crossover_preference_hz,
         )
+        if max(abs(v) for v in gain_refinement["gain_delta_db"].values()) > 0.75:  # type: ignore[union-attr]
+            rebuilt = build_with_gains(gain_refinement["gain_final_db"])  # type: ignore[arg-type]
+            gain_refinement = refine_output_gains(
+                freq,
+                rebuilt["final_channels"],  # type: ignore[arg-type]
+                avg["left_sum"],
+                avg["right_sum"],
+                target_db,
+                fc,
+                rebuilt["gains"],  # type: ignore[arg-type]
+                crossover_preference_hz=crossover_preference_hz,
+            )
+            gain_refinement["rebuilt_after_large_delta"] = True
+            built = apply_gain_refinement(rebuilt, gain_refinement)
+        else:
+            gain_refinement["rebuilt_after_large_delta"] = False
+            built = apply_gain_refinement(built, gain_refinement)
 
     return {
         "fc": fc,
@@ -1257,10 +1869,11 @@ def build_final_filter_system(
         "sub_hp_filters": sub_hp_filters,
         "xover": xover,
         "delays": delays,
-        "gains": gains,
-        "results": results,
-        "corrected": corrected,
-        "final_channels": final_channels,
+        "gains": built["gains"],
+        "gain_refinement": gain_refinement_metadata(gain_refinement),
+        "results": built["results"],
+        "corrected": built["corrected"],
+        "final_channels": built["final_channels"],
         "crossover_filters": {
             "left": lr4_filters(fc, "hp"),
             "right": lr4_filters(fc, "hp"),
@@ -1368,6 +1981,50 @@ def summarize_filters(filters: Sequence[Biquad]) -> Tuple[float, float]:
     return float(np.max(np.maximum(gains, 0.0))), float(np.min(np.minimum(gains, 0.0)))
 
 
+def channel_filter_boost_db(result: ChannelResult, freq: np.ndarray) -> np.ndarray:
+    return db(cascade_response(result.peq, freq) * fir_response(result.fir, freq))
+
+
+def max_filter_boost_below_hz(
+    freq: np.ndarray,
+    results: Sequence[ChannelResult],
+    channel_key: str,
+    limit_hz: float,
+) -> float:
+    for result in results:
+        if result.key == channel_key:
+            mask = freq < limit_hz
+            if not np.any(mask):
+                return 0.0
+            return float(np.max(channel_filter_boost_db(result, freq)[mask]))
+    return 0.0
+
+
+def distortion_guardrail_note(
+    distortion: Dict[str, np.ndarray] | None,
+    freq: np.ndarray,
+    results: Sequence[ChannelResult],
+    no_boost_below_hz: float = 25.0,
+) -> str:
+    if distortion is None:
+        return "No distortion file was found."
+    d_freq = distortion["freq"]
+    thd = distortion["thd_pct"]
+    low = (d_freq >= 20.0) & (d_freq <= 120.0)
+    measurement = str(distortion.get("measurement", ["unknown"])[0])
+    median_thd = float(np.median(thd[low])) if np.any(low) else float(np.median(thd))
+    actual_boost = max_filter_boost_below_hz(freq, results, "sub", no_boost_below_hz)
+    note = (
+        "Distortion guardrail used from Distortion.txt "
+        f"({measurement}); median THD 20-120 Hz is {median_thd:.2f}%. "
+        f"Sub boost cap below {no_boost_below_hz:g} Hz: +0.0 dB; "
+        f"actual max Sub PEQ+FIR boost below {no_boost_below_hz:g} Hz is {actual_boost:+.2f} dB"
+    )
+    if actual_boost <= 0.1:
+        return note + ", so boosts below 25 Hz were avoided."
+    return note + ", so boosts below 25 Hz were not fully avoided."
+
+
 def build_report(
     out: Path,
     notes: Sequence[str],
@@ -1388,6 +2045,7 @@ def build_report(
     midbass_rows: Sequence[Dict[str, float]],
     fir_method: str,
     fir_ls_settings: Dict[str, float],
+    exact_candidate_limit: int,
 ) -> None:
     lines: List[str] = []
     lines.append("# miniDSP 2x4 HD Filter Report")
@@ -1404,18 +2062,25 @@ def build_report(
     lines.append(f"- Sub correction lower limit: {sub_low_freq:g} Hz")
     lines.append(f"- Sub relative gain from crossover search: {crossover['sub_gain_db']:+.2f} dB")
     lines.append(f"- Sub relative delay from crossover search: {crossover['sub_delay_ms']:+.2f} ms")
+    lines.append(
+        f"- Exact crossover candidates rescored: {crossover.get('exact_candidates_scored', 0)} of "
+        f"{exact_candidate_limit}"
+    )
     if boundary_warning:
         lines.append(f"- Crossover search warning: {boundary_warning}")
     lines.append(f"- Mic calibration policy: {mic_cal_policy}. {mic_compare_note}")
     lines.append("- PEQ selection: greedy seeds refined with bounded SciPy soft-L1 least squares.")
     if fir_method == "ls":
         lines.append(
-            "- FIR solver: weighted regularized least-squares acoustic inverse "
+            "- FIR requested: weighted regularized least-squares "
             f"({fir_ls_settings['grid_points']:.0f} design points, lambda {fir_ls_settings['lambda_reg']:.4g}, "
+            f"phase mode {fir_ls_settings['phase_mode']}, fallback {fir_ls_settings['fallback']}, "
             f"boost/cut guardrails +{fir_ls_settings['max_boost_db']:.1f}/-{fir_ls_settings['max_cut_db']:.1f} dB)."
         )
     else:
-        lines.append("- FIR solver: legacy smoothed magnitude inverse via frequency sampling and windowed truncation.")
+        lines.append("- FIR requested: legacy smoothed magnitude inverse via frequency sampling and windowed truncation.")
+    for result in results:
+        lines.append(f"- {result.title} FIR used: {result.fir_used_method}.")
     lines.append(
         f"- FIR target delay compensation: Sub FIR target delay is "
         f"{fir_group_delay_ms(FIR_TAPS['sub']) - fir_group_delay_ms(FIR_TAPS['left']):.3f} ms "
@@ -1573,7 +2238,9 @@ def write_settings_summary(
             f"Sub FIR group delay is {fir_group_delay_ms(FIR_TAPS['sub']):.3f} ms.",
             f"Left/Right FIR group delay is {fir_group_delay_ms(FIR_TAPS['left']):.3f} ms.",
             "The output delays above include this difference.",
-            f"FIR solver: {'weighted regularized least-squares acoustic inverse' if fir_method == 'ls' else 'legacy smoothed magnitude inverse'}",
+            f"FIR requested: {'weighted regularized least-squares' if fir_method == 'ls' else 'legacy smoothed magnitude inverse'}",
+            "FIR used:",
+            *[f"{result.title}: {result.fir_used_method}" for result in results],
             "",
             "FIR imports:",
             "File Mode binary:",
@@ -1675,6 +2342,30 @@ def main() -> int:
         default=10.0,
         help="Maximum FIR cut requested by the LS target before solving.",
     )
+    parser.add_argument(
+        "--fir-ls-phase-mode",
+        choices=("magnitude", "complex-inverse"),
+        default="magnitude",
+        help="LS FIR phase target. 'magnitude' keeps linear FIR delay; 'complex-inverse' also inverts measured phase.",
+    )
+    parser.add_argument(
+        "--fir-ls-fallback",
+        choices=("on", "off"),
+        default="on",
+        help="When on, use legacy FIR for any channel where LS fails the RMS acceptance gate.",
+    )
+    parser.add_argument(
+        "--gain-refinement",
+        choices=("on", "off"),
+        default="on",
+        help="Refine final output gains after PEQ/FIR construction.",
+    )
+    parser.add_argument(
+        "--exact-candidates",
+        type=int,
+        default=30,
+        help="Number of proxy crossover candidates to rescore with the full final-system objective.",
+    )
     args = parser.parse_args()
 
     root = args.root.resolve()
@@ -1745,6 +2436,8 @@ def main() -> int:
         "lambda_reg": float(args.fir_ls_lambda),
         "max_boost_db": float(args.fir_ls_max_boost_db),
         "max_cut_db": float(args.fir_ls_max_cut_db),
+        "phase_mode": args.fir_ls_phase_mode,
+        "fallback": args.fir_ls_fallback,
     }
 
     proxy_crossover = optimize_crossover(
@@ -1785,6 +2478,10 @@ def main() -> int:
                 fir_ls_lambda=args.fir_ls_lambda,
                 fir_ls_max_boost_db=args.fir_ls_max_boost_db,
                 fir_ls_max_cut_db=args.fir_ls_max_cut_db,
+                fir_ls_phase_mode=args.fir_ls_phase_mode,
+                fir_ls_fallback=args.fir_ls_fallback,
+                gain_refinement_enabled=args.gain_refinement == "on",
+                crossover_preference_hz=args.prefer_crossover,
             )
         return score_final_system_candidate(
             freq=freq,
@@ -1799,7 +2496,7 @@ def main() -> int:
     crossover = select_exact_crossover_candidate(
         proxy_crossover["top_candidates"],
         exact_scorer=exact_scorer,
-        max_candidates=5,
+        max_candidates=args.exact_candidates,
     )
     selected_system = system_cache[candidate_key(crossover)]
     fc = float(crossover["crossover_hz"])
@@ -1809,6 +2506,7 @@ def main() -> int:
     corrected = selected_system["corrected"]  # type: ignore[assignment]
     final_channels = selected_system["final_channels"]  # type: ignore[assignment]
     crossover_filters = selected_system["crossover_filters"]  # type: ignore[assignment]
+    gain_refinement = selected_system["gain_refinement"]  # type: ignore[assignment]
 
     # Predicted combined response after the actual miniDSP output delays.
     pred_lsum = final_channels["left"] + final_channels["sub"]
@@ -1857,21 +2555,7 @@ def main() -> int:
     else:
         boundary_warning = ""
 
-    distortion_note = "No distortion file was found."
-    if distortion is not None:
-        d_freq = distortion["freq"]
-        thd = distortion["thd_pct"]
-        low = (d_freq >= 20.0) & (d_freq <= 120.0)
-        below_25 = (d_freq >= 10.0) & (d_freq < 25.0)
-        distortion_note = (
-            "Distortion guardrail used from Distortion.txt "
-            f"({str(distortion['measurement'][0])}); median THD 20-120 Hz is "
-            f"{float(np.median(thd[low])):.2f}%"
-        )
-        if np.any(below_25) and float(np.max(thd[below_25])) > 5.0:
-            distortion_note += ", so boosts below 25 Hz were avoided."
-        else:
-            distortion_note += "."
+    distortion_note = distortion_guardrail_note(distortion, freq, results)
 
     # Write files.
     for result in results:
@@ -1936,6 +2620,7 @@ def main() -> int:
         midbass_rows=midbass_rows,
         fir_method=args.fir_method,
         fir_ls_settings=fir_ls_settings,
+        exact_candidate_limit=args.exact_candidates,
     )
 
     metadata = {
@@ -1948,6 +2633,7 @@ def main() -> int:
         "sub_low_freq": args.sub_low_freq,
         "sub_highpass_hz": args.sub_highpass_hz,
         "crossover": crossover,
+        "exact_crossover_selection": crossover_selection_metadata(crossover),
         "crossover_boundary_warning": boundary_warning,
         "target_offset_db": shift,
         "delays_ms": delays,
@@ -1961,9 +2647,18 @@ def main() -> int:
         "fir_taps": FIR_TAPS,
         "fir_method": args.fir_method,
         "fir_ls_settings": fir_ls_settings if args.fir_method == "ls" else None,
+        "gain_refinement": gain_refinement,
         "validations": validations,
         "midbass_alignment": midbass_rows,
         "peq_optimizer": {result.key: result.peq_optimization for result in results},
+        "fir": {
+            result.key: {
+                "requested_method": result.fir_requested_method,
+                "used_method": result.fir_used_method,
+                "metrics": result.fir_metrics,
+            }
+            for result in results
+        },
         "filters": {
             result.key: [
                 {

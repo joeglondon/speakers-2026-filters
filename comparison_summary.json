@@ -1,0 +1,380 @@
+{
+  "profiles": [
+    {
+      "artifact_dir": "Output_ls_auto_50_140",
+      "channel_rms_db": {
+        "left": {
+          "after": 10.19,
+          "before": 5.45
+        },
+        "right": {
+          "after": 7.28,
+          "before": 5.54
+        },
+        "sub": {
+          "after": 9.15,
+          "before": 7.4
+        }
+      },
+      "command": [
+        "/Users/josephlondon/.cache/codex-runtimes/codex-primary-runtime/dependencies/python/bin/python3",
+        "/Users/josephlondon/Desktop/Speakers 2026/generate_minidsp_filters.py",
+        "--root",
+        "/Users/josephlondon/Desktop/Speakers 2026",
+        "--output",
+        "/Users/josephlondon/Desktop/Speakers 2026/Baseline_Runs/ls_auto_50_140",
+        "--target-file",
+        "Harman Target extrapolated to 15Hz.txt",
+        "--min-crossover",
+        "50",
+        "--max-crossover",
+        "140",
+        "--sub-low-freq",
+        "15",
+        "--sub-highpass-hz",
+        "0",
+        "--mic-cal-policy",
+        "trust-exports",
+        "--fir-method",
+        "ls",
+        "--exact-candidates",
+        "30",
+        "--fir-ls-phase-mode",
+        "magnitude",
+        "--fir-ls-fallback",
+        "on",
+        "--gain-refinement",
+        "on"
+      ],
+      "crossover_hz": 140.0,
+      "delays_ms": {
+        "left": 7.102083,
+        "right": 7.102083,
+        "sub": 0.0
+      },
+      "gains_db": {
+        "left": -2.975104,
+        "right": -3.827016,
+        "sub": -4.100565
+      },
+      "max_boost_below_25hz_db": {
+        "left": 2.23581,
+        "right": 2.182878,
+        "sub": -10.226451
+      },
+      "name": "ls_auto_50_140",
+      "sub_relative_delay_ms": -1.8,
+      "sub_relative_gain_db": -0.5,
+      "sum_rms_50_160_db": {
+        "left_plus_sub": 12.266478,
+        "right_plus_sub": 10.86536
+      },
+      "worst_cancellation": {
+        "db": -4.649462,
+        "hz": 139.8926
+      }
+    },
+    {
+      "artifact_dir": "Output_fixed_harman_15hz_no_sub_hp_max140",
+      "channel_rms_db": {
+        "left": {
+          "after": 4.48,
+          "before": 5.45
+        },
+        "right": {
+          "after": 4.51,
+          "before": 5.54
+        },
+        "sub": {
+          "after": 5.08,
+          "before": 7.4
+        }
+      },
+      "command": [
+        "/Users/josephlondon/.cache/codex-runtimes/codex-primary-runtime/dependencies/python/bin/python3",
+        "/Users/josephlondon/Desktop/Speakers 2026/generate_minidsp_filters.py",
+        "--root",
+        "/Users/josephlondon/Desktop/Speakers 2026",
+        "--output",
+        "/Users/josephlondon/Desktop/Speakers 2026/Baseline_Runs/legacy_auto_50_140",
+        "--target-file",
+        "Harman Target extrapolated to 15Hz.txt",
+        "--min-crossover",
+        "50",
+        "--max-crossover",
+        "140",
+        "--sub-low-freq",
+        "15",
+        "--sub-highpass-hz",
+        "0",
+        "--mic-cal-policy",
+        "trust-exports",
+        "--fir-method",
+        "legacy",
+        "--exact-candidates",
+        "30",
+        "--fir-ls-phase-mode",
+        "magnitude",
+        "--fir-ls-fallback",
+        "on",
+        "--gain-refinement",
+        "on"
+      ],
+      "crossover_hz": 140.0,
+      "delays_ms": {
+        "left": 7.102083,
+        "right": 7.102083,
+        "sub": 0.0
+      },
+      "gains_db": {
+        "left": -2.975104,
+        "right": -3.827016,
+        "sub": -4.100565
+      },
+      "max_boost_below_25hz_db": {
+        "left": -0.426051,
+        "right": -0.460841,
+        "sub": 5.561477
+      },
+      "name": "legacy_auto_50_140",
+      "sub_relative_delay_ms": -1.8,
+      "sub_relative_gain_db": -0.5,
+      "sum_rms_50_160_db": {
+        "left_plus_sub": 6.883845,
+        "right_plus_sub": 6.740493
+      },
+      "worst_cancellation": {
+        "db": -4.484404,
+        "hz": 120.1172
+      }
+    },
+    {
+      "artifact_dir": "Top_Three_Profiles/Profile_02_clean_140hz",
+      "channel_rms_db": {
+        "left": {
+          "after": 4.48,
+          "before": 5.45
+        },
+        "right": {
+          "after": 4.51,
+          "before": 5.54
+        },
+        "sub": {
+          "after": 5.08,
+          "before": 7.4
+        }
+      },
+      "command": [
+        "/Users/josephlondon/.cache/codex-runtimes/codex-primary-runtime/dependencies/python/bin/python3",
+        "/Users/josephlondon/Desktop/Speakers 2026/generate_minidsp_filters.py",
+        "--root",
+        "/Users/josephlondon/Desktop/Speakers 2026",
+        "--output",
+        "/Users/josephlondon/Desktop/Speakers 2026/Baseline_Runs/profile_02_clean_140hz",
+        "--target-file",
+        "Harman Target extrapolated to 15Hz.txt",
+        "--min-crossover",
+        "140",
+        "--max-crossover",
+        "140",
+        "--sub-low-freq",
+        "15",
+        "--sub-highpass-hz",
+        "0",
+        "--mic-cal-policy",
+        "trust-exports",
+        "--fir-method",
+        "legacy",
+        "--exact-candidates",
+        "30",
+        "--fir-ls-phase-mode",
+        "magnitude",
+        "--fir-ls-fallback",
+        "on",
+        "--gain-refinement",
+        "on",
+        "--prefer-crossover",
+        "140"
+      ],
+      "crossover_hz": 140.0,
+      "delays_ms": {
+        "left": 7.102083,
+        "right": 7.102083,
+        "sub": 0.0
+      },
+      "gains_db": {
+        "left": -2.975104,
+        "right": -3.827016,
+        "sub": -4.100565
+      },
+      "max_boost_below_25hz_db": {
+        "left": -0.426051,
+        "right": -0.460841,
+        "sub": 5.561477
+      },
+      "name": "profile_02_clean_140hz",
+      "sub_relative_delay_ms": -1.8,
+      "sub_relative_gain_db": -0.5,
+      "sum_rms_50_160_db": {
+        "left_plus_sub": 6.883845,
+        "right_plus_sub": 6.740493
+      },
+      "worst_cancellation": {
+        "db": -4.484404,
+        "hz": 120.1172
+      }
+    },
+    {
+      "artifact_dir": "Top_Three_Profiles/Profile_03_2023ish_54hz",
+      "channel_rms_db": {
+        "left": {
+          "after": 4.41,
+          "before": 5.41
+        },
+        "right": {
+          "after": 4.48,
+          "before": 5.49
+        },
+        "sub": {
+          "after": 9.45,
+          "before": 15.89
+        }
+      },
+      "command": [
+        "/Users/josephlondon/.cache/codex-runtimes/codex-primary-runtime/dependencies/python/bin/python3",
+        "/Users/josephlondon/Desktop/Speakers 2026/generate_minidsp_filters.py",
+        "--root",
+        "/Users/josephlondon/Desktop/Speakers 2026",
+        "--output",
+        "/Users/josephlondon/Desktop/Speakers 2026/Baseline_Runs/profile_03_2023ish_54hz",
+        "--target-file",
+        "Harman Target extrapolated to 15Hz.txt",
+        "--min-crossover",
+        "54",
+        "--max-crossover",
+        "54",
+        "--sub-low-freq",
+        "15",
+        "--sub-highpass-hz",
+        "0",
+        "--mic-cal-policy",
+        "trust-exports",
+        "--fir-method",
+        "legacy",
+        "--exact-candidates",
+        "30",
+        "--fir-ls-phase-mode",
+        "magnitude",
+        "--fir-ls-fallback",
+        "on",
+        "--gain-refinement",
+        "on",
+        "--prefer-crossover",
+        "54"
+      ],
+      "crossover_hz": 54.0,
+      "delays_ms": {
+        "left": 1.827083,
+        "right": 1.827083,
+        "sub": 0.0
+      },
+      "gains_db": {
+        "left": -2.980282,
+        "right": -3.822514,
+        "sub": -7.384721
+      },
+      "max_boost_below_25hz_db": {
+        "left": 0.047258,
+        "right": 0.519709,
+        "sub": 7.593103
+      },
+      "name": "profile_03_2023ish_54hz",
+      "sub_relative_delay_ms": 3.475,
+      "sub_relative_gain_db": -10.75,
+      "sum_rms_50_160_db": {
+        "left_plus_sub": 9.647025,
+        "right_plus_sub": 9.123895
+      },
+      "worst_cancellation": {
+        "db": -7.218929,
+        "hz": 68.8477
+      }
+    },
+    {
+      "artifact_dir": "Top_Three_Profiles/Profile_04_compromise_95hz",
+      "channel_rms_db": {
+        "left": {
+          "after": 4.46,
+          "before": 5.44
+        },
+        "right": {
+          "after": 4.49,
+          "before": 5.52
+        },
+        "sub": {
+          "after": 3.57,
+          "before": 6.14
+        }
+      },
+      "command": [
+        "/Users/josephlondon/.cache/codex-runtimes/codex-primary-runtime/dependencies/python/bin/python3",
+        "/Users/josephlondon/Desktop/Speakers 2026/generate_minidsp_filters.py",
+        "--root",
+        "/Users/josephlondon/Desktop/Speakers 2026",
+        "--output",
+        "/Users/josephlondon/Desktop/Speakers 2026/Baseline_Runs/profile_04_compromise_95hz",
+        "--target-file",
+        "Harman Target extrapolated to 15Hz.txt",
+        "--min-crossover",
+        "95",
+        "--max-crossover",
+        "95",
+        "--sub-low-freq",
+        "15",
+        "--sub-highpass-hz",
+        "0",
+        "--mic-cal-policy",
+        "trust-exports",
+        "--fir-method",
+        "legacy",
+        "--exact-candidates",
+        "30",
+        "--fir-ls-phase-mode",
+        "magnitude",
+        "--fir-ls-fallback",
+        "on",
+        "--gain-refinement",
+        "on",
+        "--prefer-crossover",
+        "95"
+      ],
+      "crossover_hz": 95.0,
+      "delays_ms": {
+        "left": 8.852083,
+        "right": 8.852083,
+        "sub": 0.0
+      },
+      "gains_db": {
+        "left": -2.975614,
+        "right": -3.822484,
+        "sub": 4.188292
+      },
+      "max_boost_below_25hz_db": {
+        "left": 0.175878,
+        "right": 0.278114,
+        "sub": -0.352312
+      },
+      "name": "profile_04_compromise_95hz",
+      "sub_relative_delay_ms": -3.55,
+      "sub_relative_gain_db": 2.0,
+      "sum_rms_50_160_db": {
+        "left_plus_sub": 9.583608,
+        "right_plus_sub": 8.802396
+      },
+      "worst_cancellation": {
+        "db": -11.818395,
+        "hz": 130.0049
+      }
+    }
+  ]
+}
