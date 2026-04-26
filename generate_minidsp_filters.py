@@ -61,6 +61,44 @@ class ImpulseMeasurement:
 
 
 @dataclass
+class MultiPointResponses:
+    freq: np.ndarray
+    responses: Dict[str, List[np.ndarray]]
+
+    def __post_init__(self) -> None:
+        self.freq = np.asarray(self.freq, dtype=np.float64)
+        if self.freq.ndim != 1 or self.freq.size == 0:
+            raise ValueError("Multipoint frequency grid must be a non-empty vector.")
+        for key, positions in self.responses.items():
+            if not positions:
+                raise ValueError(f"Multipoint channel {key} has no positions.")
+            checked = []
+            for response in positions:
+                arr = np.asarray(response, dtype=np.complex128)
+                if arr.shape != self.freq.shape:
+                    raise ValueError(f"Multipoint channel {key} response shape mismatch.")
+                checked.append(arr)
+            self.responses[key] = checked
+
+    def position_count(self, key: str | None = None) -> int:
+        if key is not None:
+            return len(self.responses[key])
+        counts = {len(positions) for positions in self.responses.values()}
+        if len(counts) != 1:
+            raise ValueError("Multipoint channels do not all have the same position count.")
+        return counts.pop()
+
+    def average(self, key: str) -> np.ndarray:
+        return average_complex(self.responses[key])
+
+    def training_indices(self, held_out: int | None = None) -> List[int]:
+        indices = list(range(self.position_count()))
+        if held_out is None:
+            return indices
+        return [idx for idx in indices if idx != held_out]
+
+
+@dataclass
 class Biquad:
     kind: str
     freq: float
@@ -103,7 +141,7 @@ class ChannelResult:
     rms_after_peq_db: float = 0.0
     fir_requested_method: str = "legacy"
     fir_used_method: str = "legacy"
-    fir_metrics: Dict[str, float] | None = None
+    fir_metrics: Dict[str, object] | None = None
 
 
 @dataclass
@@ -378,12 +416,84 @@ def average_impulse(measurements: Sequence[ImpulseMeasurement]) -> np.ndarray:
     return np.mean(np.vstack(aligned), axis=0)
 
 
+def impulse_to_frequency_response(
+    measurement: ImpulseMeasurement,
+    freq: np.ndarray,
+) -> np.ndarray:
+    """Evaluate an exported impulse response at arbitrary frequencies."""
+    freq = np.asarray(freq, dtype=np.float64)
+    spectrum_freq = np.fft.rfftfreq(measurement.samples.size, d=measurement.sample_interval)
+    spectrum = np.fft.rfft(measurement.samples)
+    real = np.interp(freq, spectrum_freq, np.real(spectrum), left=np.real(spectrum[0]), right=np.real(spectrum[-1]))
+    imag = np.interp(freq, spectrum_freq, np.imag(spectrum), left=np.imag(spectrum[0]), right=np.imag(spectrum[-1]))
+    return real + 1j * imag
+
+
+def build_multipoint_responses(
+    freq: np.ndarray,
+    spl: Dict[str, SPLMeasurement],
+    groups: Dict[str, Sequence[str]],
+    mic_freq: np.ndarray,
+    mic_db: np.ndarray,
+    mic_cal_policy: str,
+) -> MultiPointResponses:
+    return MultiPointResponses(
+        freq=freq,
+        responses={
+            key: [
+                complex_from_spl(
+                    spl[name],
+                    mic_freq,
+                    mic_db,
+                    mic_cal_policy=mic_cal_policy,
+                )
+                for name in names
+            ]
+            for key, names in groups.items()
+        },
+    )
+
+
+def build_multipoint_impulse_responses(
+    freq: np.ndarray,
+    impulse: Dict[str, ImpulseMeasurement],
+    groups: Dict[str, Sequence[str]],
+) -> MultiPointResponses:
+    return MultiPointResponses(
+        freq=freq,
+        responses={
+            key: [impulse_to_frequency_response(impulse[name], freq) for name in names]
+            for key, names in groups.items()
+        },
+    )
+
+
 def db(x: np.ndarray) -> np.ndarray:
     return 20.0 * np.log10(np.maximum(np.abs(x), EPS))
 
 
 def rms(values: np.ndarray) -> float:
     return float(np.sqrt(np.mean(np.square(values)))) if values.size else float("nan")
+
+
+def multipoint_magnitude_score(
+    responses: Sequence[np.ndarray],
+    target_db: np.ndarray,
+    mask: np.ndarray,
+) -> Dict[str, float]:
+    errors = np.asarray(
+        [rms(db(np.asarray(response)[mask]) - target_db[mask]) for response in responses],
+        dtype=np.float64,
+    )
+    median = float(np.median(errors)) if errors.size else float("nan")
+    p80 = float(np.percentile(errors, 80.0)) if errors.size else float("nan")
+    worst = float(np.max(errors)) if errors.size else float("nan")
+    return {
+        "score": float(0.55 * median + 0.35 * p80 + 0.10 * worst),
+        "median_rms_db": median,
+        "p80_rms_db": p80,
+        "worst_rms_db": worst,
+    }
 
 
 def boost_cap_curve_db(
@@ -1243,6 +1353,95 @@ def make_fir_ls(
     return fir.astype(np.float64)
 
 
+def _require_cvxpy():
+    try:
+        import cvxpy as cp
+    except ImportError as exc:
+        raise RuntimeError(
+            "Frontier FIR mode requires cvxpy. Install dependencies with `python -m pip install -r requirements.txt`."
+        ) from exc
+    return cp
+
+
+def make_frontier_fir(
+    freq: np.ndarray,
+    measured_positions: Sequence[np.ndarray],
+    target_db: np.ndarray,
+    taps: int,
+    correction_mask: np.ndarray,
+    fs: float = OUT_FS,
+    grid_points: int = 1024,
+    max_boost_db: float = 3.0,
+    max_cut_db: float = 10.0,
+    boost_cap_db: np.ndarray | None = None,
+    max_filter_energy_db: float = 18.0,
+    pre_ringing_limit_db: float = -18.0,
+) -> Tuple[np.ndarray, Dict[str, float | str]]:
+    if taps <= 0:
+        raise ValueError("FIR tap count must be positive")
+    if not measured_positions:
+        raise ValueError("Frontier FIR requires at least one measured position.")
+    cp = _require_cvxpy()
+    design_freq = design_fir_frequency_grid(freq, correction_mask, fs=fs, grid_points=grid_points)
+    target = np.interp(design_freq, freq, target_db, left=target_db[0], right=target_db[-1])
+    active = np.interp(design_freq, freq, correction_mask.astype(np.float64), left=0.0, right=0.0) >= 0.5
+    boost_cap_design = (
+        np.minimum(
+            np.interp(design_freq, freq, np.asarray(boost_cap_db, dtype=np.float64)),
+            float(max_boost_db),
+        )
+        if boost_cap_db is not None
+        else np.full(design_freq.shape, float(max_boost_db), dtype=np.float64)
+    )
+    n = np.arange(taps, dtype=np.float64)
+    fourier = np.exp(-1j * 2.0 * np.pi * np.outer(design_freq / fs, n))
+    delay_samples = (taps - 1) / 2.0
+    delay_phase = np.exp(-1j * 2.0 * np.pi * design_freq * (delay_samples / fs))
+    h = cp.Variable(taps)
+
+    residual_terms = []
+    for measured_response in measured_positions:
+        measured = interp_complex(freq, np.asarray(measured_response, dtype=np.complex128), design_freq)
+        measured_db = db(measured)
+        correction_db = np.maximum(target - measured_db, -float(max_cut_db))
+        correction_db = np.minimum(correction_db, boost_cap_design)
+        correction_db[~active] = 0.0
+        desired_mag = np.abs(measured) * (10.0 ** (correction_db / 20.0))
+        desired = desired_mag * np.exp(1j * np.angle(measured)) * delay_phase
+        confidence = np.full(design_freq.shape, 0.08, dtype=np.float64)
+        confidence[active] = 1.0
+        confidence *= np.clip(np.abs(measured) / np.percentile(np.abs(measured), 75), 0.1, 1.0)
+        weighted_residual = cp.multiply(np.sqrt(confidence), cp.matmul(np.diag(measured), fourier) @ h - desired)
+        residual_terms.append(cp.sum_squares(cp.real(weighted_residual)) + cp.sum_squares(cp.imag(weighted_residual)))
+
+    constraints = []
+    max_gain = 10.0 ** (boost_cap_design / 20.0)
+    correction_rows = np.flatnonzero(active)
+    if correction_rows.size:
+        constraints.append(cp.abs(fourier[correction_rows] @ h) <= max_gain[correction_rows])
+    constraints.append(cp.norm2(h) <= 10.0 ** (float(max_filter_energy_db) / 20.0))
+    centre = taps // 2
+    pre_limit = 10.0 ** (float(pre_ringing_limit_db) / 20.0)
+    if centre > 0:
+        constraints.append(cp.norm2(h[:centre]) <= pre_limit)
+
+    objective = cp.Minimize(cp.sum(residual_terms) + 1e-4 * cp.sum_squares(second_difference_matrix(taps) @ h))
+    problem = cp.Problem(objective, constraints)
+    problem.solve(solver="CLARABEL", verbose=False)
+    if h.value is None or problem.status not in {cp.OPTIMAL, cp.OPTIMAL_INACCURATE}:
+        problem.solve(solver="SCS", verbose=False, max_iters=5000)
+    if h.value is None:
+        raise RuntimeError(f"CVXPY FIR solve failed with status {problem.status}")
+    fir = np.asarray(h.value, dtype=np.float64)
+    return fir, {
+        "method": "cvxpy",
+        "status": str(problem.status),
+        "objective": float(problem.value),
+        "positions": float(len(measured_positions)),
+        "constraints": "boost_cap,energy,pre_ringing",
+    }
+
+
 def ls_fir_correction_target(
     freq: np.ndarray,
     measured_response: np.ndarray,
@@ -1527,6 +1726,50 @@ def score_final_system_candidate(
     }
 
 
+def multipoint_final_validation(
+    freq: np.ndarray,
+    multipoint: MultiPointResponses,
+    results: Sequence[ChannelResult],
+    crossover_filters: Dict[str, Sequence[Biquad]],
+    delays: Dict[str, float],
+    target_db: np.ndarray,
+    masks: Dict[str, np.ndarray],
+) -> Dict[str, object]:
+    by_key = {result.key: result for result in results}
+    channel_scores: Dict[str, Dict[str, float]] = {}
+    final_positions: Dict[str, List[np.ndarray]] = {}
+    for key in ("left", "right", "sub"):
+        result = by_key[key]
+        filter_response = (
+            cascade_response(crossover_filters[key], freq)
+            * cascade_response(result.peq, freq)
+            * fir_response(result.fir, freq)
+            * 10.0 ** (result.gain_db / 20.0)
+        )
+        positions = [
+            apply_output_delay(position * filter_response, freq, delays[key])
+            for position in multipoint.responses[key]
+        ]
+        final_positions[key] = positions
+        channel_scores[key] = multipoint_magnitude_score(positions, target_db, masks[key])
+
+    left_sums = [
+        final_positions["left"][idx] + final_positions["sub"][idx]
+        for idx in range(multipoint.position_count())
+    ]
+    right_sums = [
+        final_positions["right"][idx] + final_positions["sub"][idx]
+        for idx in range(multipoint.position_count())
+    ]
+    sum_mask = (freq >= 50.0) & (freq <= 160.0)
+    return {
+        "positions": multipoint.position_count(),
+        "channel_scores": channel_scores,
+        "left_sum_score": multipoint_magnitude_score(left_sums, target_db, sum_mask),
+        "right_sum_score": multipoint_magnitude_score(right_sums, target_db, sum_mask),
+    }
+
+
 def apply_gain_deltas(
     final_channels: Dict[str, np.ndarray],
     deltas_db: Dict[str, float],
@@ -1704,7 +1947,15 @@ def build_final_filter_system(
     fir_ls_fallback: str = "on",
     gain_refinement_enabled: bool = True,
     crossover_preference_hz: float | None = None,
+    optimizer_mode: str = "heuristic",
+    multipoint: MultiPointResponses | None = None,
+    frontier_max_filter_energy_db: float = 18.0,
+    frontier_pre_ringing_limit_db: float = -18.0,
 ) -> Dict[str, object]:
+    if optimizer_mode not in {"heuristic", "frontier"}:
+        raise ValueError(f"Unsupported optimizer mode: {optimizer_mode}")
+    if optimizer_mode == "frontier" and multipoint is None:
+        raise ValueError("Frontier optimizer mode requires multipoint responses.")
     fc = float(crossover["crossover_hz"])
     masks = correction_masks(freq, fc, sub_low_freq=sub_low_freq)
     hp = cascade_response(lr4_filters(fc, "hp"), freq)
@@ -1768,7 +2019,27 @@ def build_final_filter_system(
                 max_cut_db=fir_ls_max_cut_db,
             )
             ls_fir = None
-            if fir_method == "ls":
+            frontier_metrics: Dict[str, object] | None = None
+            if optimizer_mode == "frontier":
+                assert multipoint is not None
+                position_after_peq = [
+                    position * xover[key] * 10.0 ** (current_gains[key] / 20.0) * peq_resp
+                    for position in multipoint.responses[key]
+                ]
+                ls_fir, frontier_metrics = make_frontier_fir(
+                    freq,
+                    position_after_peq,
+                    target_db,
+                    FIR_TAPS[key],
+                    masks[key],
+                    grid_points=fir_ls_grid_points,
+                    max_boost_db=fir_ls_max_boost_db,
+                    max_cut_db=fir_ls_max_cut_db,
+                    boost_cap_db=fir_boost_cap,
+                    max_filter_energy_db=frontier_max_filter_energy_db,
+                    pre_ringing_limit_db=frontier_pre_ringing_limit_db,
+                )
+            elif fir_method == "ls":
                 ls_fir = make_fir_ls(
                     freq,
                     after_peq,
@@ -1785,22 +2056,42 @@ def build_final_filter_system(
             elif fir_method != "legacy":
                 raise ValueError(f"Unsupported FIR method: {fir_method}")
 
-            selected_fir = choose_fir_with_fallback(
-                freq,
-                after_peq,
-                target_db,
-                masks[key],
-                requested_method=fir_method,
-                fallback_enabled=fir_ls_fallback == "on",
-                ls_fir=ls_fir,
-                legacy_fir=legacy_fir,
-                guardrail_fir=flat_delay_fir(FIR_TAPS[key]),
-                boost_cap_db=fir_boost_cap if key == "sub" else None,
-                peq_response=peq_resp,
-            )
+            if optimizer_mode == "frontier":
+                assert ls_fir is not None
+                selected_fir = {
+                    "fir": ls_fir,
+                    "used_method": "frontier cvxpy",
+                    "metrics": frontier_metrics or {},
+                }
+            else:
+                selected_fir = choose_fir_with_fallback(
+                    freq,
+                    after_peq,
+                    target_db,
+                    masks[key],
+                    requested_method=fir_method,
+                    fallback_enabled=fir_ls_fallback == "on",
+                    ls_fir=ls_fir,
+                    legacy_fir=legacy_fir,
+                    guardrail_fir=flat_delay_fir(FIR_TAPS[key]),
+                    boost_cap_db=fir_boost_cap if key == "sub" else None,
+                    peq_response=peq_resp,
+                )
             fir = selected_fir["fir"]  # type: ignore[assignment]
             f_resp = fir_response(fir, freq)
             after_all = after_peq * f_resp
+            fir_metrics = dict(selected_fir["metrics"])  # type: ignore[arg-type]
+            if optimizer_mode == "frontier":
+                assert multipoint is not None
+                position_after_all = [
+                    position * xover[key] * 10.0 ** (current_gains[key] / 20.0) * peq_resp * f_resp
+                    for position in multipoint.responses[key]
+                ]
+                fir_metrics["multipoint_score"] = multipoint_magnitude_score(
+                    position_after_all,
+                    target_db,
+                    masks[key],
+                )
             corrected[key] = after_all
             final_channels[key] = apply_output_delay(after_all, freq, delays[key])
             max_boost, max_cut = summarize_filters(peq)
@@ -1821,9 +2112,9 @@ def build_final_filter_system(
                     max_boost_db=max_boost,
                     max_cut_db=max_cut,
                     rms_after_peq_db=channel_rms_error(after_peq, target_db, masks[key]),
-                    fir_requested_method=fir_method,
+                    fir_requested_method="frontier" if optimizer_mode == "frontier" else fir_method,
                     fir_used_method=str(selected_fir["used_method"]),
-                    fir_metrics=selected_fir["metrics"],  # type: ignore[arg-type]
+                    fir_metrics=fir_metrics,
                 )
             )
         return {
@@ -2096,7 +2387,15 @@ def build_report(
         lines.append(f"- Crossover search warning: {boundary_warning}")
     lines.append(f"- Mic calibration policy: {mic_cal_policy}. {mic_compare_note}")
     lines.append("- PEQ selection: greedy seeds refined with bounded SciPy soft-L1 least squares.")
-    if fir_method == "ls":
+    frontier_requested = any(result.fir_requested_method == "frontier" for result in results)
+    if frontier_requested:
+        lines.append(
+            "- FIR requested: frontier constrained multipoint CVXPY design "
+            f"({fir_ls_settings['grid_points']:.0f} design points, phase strategy "
+            f"{fir_ls_settings.get('phase_strategy', 'minphase-limited-excess')}, "
+            f"boost/cut guardrails +{fir_ls_settings['max_boost_db']:.1f}/-{fir_ls_settings['max_cut_db']:.1f} dB)."
+        )
+    elif fir_method == "ls":
         lines.append(
             "- FIR requested: weighted regularized least-squares "
             f"({fir_ls_settings['grid_points']:.0f} design points, lambda {fir_ls_settings['lambda_reg']:.4g}, "
@@ -2264,7 +2563,12 @@ def write_settings_summary(
             f"Sub FIR group delay is {fir_group_delay_ms(FIR_TAPS['sub']):.3f} ms.",
             f"Left/Right FIR group delay is {fir_group_delay_ms(FIR_TAPS['left']):.3f} ms.",
             "The output delays above include this difference.",
-            f"FIR requested: {'weighted regularized least-squares' if fir_method == 'ls' else 'legacy smoothed magnitude inverse'}",
+            "FIR requested: "
+            + (
+                "frontier constrained multipoint CVXPY"
+                if any(result.fir_requested_method == "frontier" for result in results)
+                else ("weighted regularized least-squares" if fir_method == "ls" else "legacy smoothed magnitude inverse")
+            ),
             "FIR used:",
             *[f"{result.title}: {result.fir_used_method}" for result in results],
             "",
@@ -2381,6 +2685,42 @@ def main() -> int:
         help="When on, use legacy FIR for any channel where LS fails the RMS acceptance gate.",
     )
     parser.add_argument(
+        "--optimizer-mode",
+        choices=("heuristic", "frontier"),
+        default="heuristic",
+        help="Optimization architecture. Frontier mode keeps measurement positions separate and uses constrained CVXPY FIR.",
+    )
+    parser.add_argument(
+        "--validation-mode",
+        choices=("none", "leave-one-out"),
+        default="leave-one-out",
+        help="Validation reporting mode for frontier metadata.",
+    )
+    parser.add_argument(
+        "--phase-strategy",
+        choices=("magnitude", "minphase-limited-excess"),
+        default="minphase-limited-excess",
+        help="Frontier phase policy metadata; FIR design preserves measured phase plus bounded linear delay.",
+    )
+    parser.add_argument(
+        "--pre-ringing-limit-db",
+        type=float,
+        default=-18.0,
+        help="Frontier FIR pre-center coefficient energy limit in dB.",
+    )
+    parser.add_argument(
+        "--max-filter-energy-db",
+        type=float,
+        default=18.0,
+        help="Frontier FIR total coefficient energy limit in dB.",
+    )
+    parser.add_argument(
+        "--fir-solver",
+        choices=("cvxpy",),
+        default="cvxpy",
+        help="Constrained FIR solver used by frontier mode.",
+    )
+    parser.add_argument(
         "--gain-refinement",
         choices=("on", "off"),
         default="on",
@@ -2436,24 +2776,29 @@ def main() -> int:
         "left_sum": group_names("L + Sub"),
         "right_sum": group_names("R + Sub"),
     }
-    avg = {
-        key: average_complex(
-            [
-                complex_from_spl(
-                    spl[name],
-                    mic_freq,
-                    mic_db,
-                    mic_cal_policy=generation_mic_policy,
-                )
-                for name in names
-            ]
-        )
-        for key, names in groups.items()
-    }
+    multipoint = build_multipoint_responses(
+        freq,
+        spl,
+        groups,
+        mic_freq,
+        mic_db,
+        mic_cal_policy=generation_mic_policy,
+    )
+    impulse_multipoint = build_multipoint_impulse_responses(freq, impulse, groups)
+    avg = {key: multipoint.average(key) for key in groups}
     avg_ir = {
         key: average_impulse([impulse[name] for name in names])
         for key, names in groups.items()
     }
+    impulse_consistency = {
+        key: rms(db(avg[key]) - db(impulse_multipoint.average(key)))
+        for key in groups
+    }
+    validation_notes.append(
+        "Built multipoint SPL and impulse response models; SPL/impulse magnitude RMS deltas "
+        + ", ".join(f"{key} {value:.2f} dB" for key, value in impulse_consistency.items())
+        + "."
+    )
 
     shift = 0.0 if args.absolute_target else target_shift(freq, target_db, avg["left"], avg["right"])
     shifted_target_db = target_db + shift
@@ -2464,6 +2809,12 @@ def main() -> int:
         "max_cut_db": float(args.fir_ls_max_cut_db),
         "phase_mode": args.fir_ls_phase_mode,
         "fallback": args.fir_ls_fallback,
+        "optimizer_mode": args.optimizer_mode,
+        "validation_mode": args.validation_mode,
+        "phase_strategy": args.phase_strategy,
+        "fir_solver": args.fir_solver,
+        "max_filter_energy_db": float(args.max_filter_energy_db),
+        "pre_ringing_limit_db": float(args.pre_ringing_limit_db),
     }
 
     proxy_crossover = optimize_crossover(
@@ -2480,6 +2831,7 @@ def main() -> int:
         sub_highpass_hz=args.sub_highpass_hz,
     )
     system_cache: Dict[Tuple[float, float, float], Dict[str, object]] = {}
+    frontier_selection_cache: Dict[Tuple[float, float, float], Dict[str, object]] = {}
 
     def candidate_key(candidate: Dict[str, float]) -> Tuple[float, float, float]:
         return (
@@ -2508,6 +2860,7 @@ def main() -> int:
                 fir_ls_fallback=args.fir_ls_fallback,
                 gain_refinement_enabled=args.gain_refinement == "on",
                 crossover_preference_hz=args.prefer_crossover,
+                optimizer_mode="heuristic",
             )
         return score_final_system_candidate(
             freq=freq,
@@ -2524,7 +2877,31 @@ def main() -> int:
         exact_scorer=exact_scorer,
         max_candidates=args.exact_candidates,
     )
-    selected_system = system_cache[candidate_key(crossover)]
+    selected_key = candidate_key(crossover)
+    if args.optimizer_mode == "frontier":
+        frontier_selection_cache[selected_key] = build_final_filter_system(
+            freq=freq,
+            avg=avg,
+            target_db=shifted_target_db,
+            crossover=crossover,
+            sub_low_freq=args.sub_low_freq,
+            sub_highpass_hz=args.sub_highpass_hz,
+            distortion=distortion,
+            fir_method=args.fir_method,
+            fir_ls_grid_points=args.fir_ls_grid_points,
+            fir_ls_lambda=args.fir_ls_lambda,
+            fir_ls_max_boost_db=args.fir_ls_max_boost_db,
+            fir_ls_max_cut_db=args.fir_ls_max_cut_db,
+            fir_ls_phase_mode=args.fir_ls_phase_mode,
+            fir_ls_fallback=args.fir_ls_fallback,
+            gain_refinement_enabled=args.gain_refinement == "on",
+            crossover_preference_hz=args.prefer_crossover,
+            optimizer_mode="frontier",
+            multipoint=multipoint,
+            frontier_max_filter_energy_db=args.max_filter_energy_db,
+            frontier_pre_ringing_limit_db=args.pre_ringing_limit_db,
+        )
+    selected_system = frontier_selection_cache.get(selected_key, system_cache[selected_key])
     fc = float(crossover["crossover_hz"])
     delays = selected_system["delays"]  # type: ignore[assignment]
     gains = selected_system["gains"]  # type: ignore[assignment]
@@ -2533,6 +2910,19 @@ def main() -> int:
     final_channels = selected_system["final_channels"]  # type: ignore[assignment]
     crossover_filters = selected_system["crossover_filters"]  # type: ignore[assignment]
     gain_refinement = selected_system["gain_refinement"]  # type: ignore[assignment]
+    multipoint_validation = (
+        multipoint_final_validation(
+            freq,
+            multipoint,
+            results,
+            crossover_filters,
+            delays,
+            shifted_target_db,
+            selected_system["masks"],  # type: ignore[arg-type]
+        )
+        if args.optimizer_mode == "frontier" and args.validation_mode == "leave-one-out"
+        else None
+    )
 
     # Predicted combined response after the actual miniDSP output delays.
     pred_lsum = final_channels["left"] + final_channels["sub"]
@@ -2672,9 +3062,15 @@ def main() -> int:
         "gains_db": gains,
         "fir_taps": FIR_TAPS,
         "fir_method": args.fir_method,
-        "fir_ls_settings": fir_ls_settings if args.fir_method == "ls" else None,
+        "optimizer_mode": args.optimizer_mode,
+        "validation_mode": args.validation_mode,
+        "phase_strategy": args.phase_strategy,
+        "multipoint_positions": multipoint.position_count(),
+        "impulse_consistency_rms_db": impulse_consistency,
+        "fir_ls_settings": fir_ls_settings if args.fir_method == "ls" or args.optimizer_mode == "frontier" else None,
         "gain_refinement": gain_refinement,
         "validations": validations,
+        "multipoint_validation": multipoint_validation,
         "midbass_alignment": midbass_rows,
         "peq_optimizer": {result.key: result.peq_optimization for result in results},
         "fir": {

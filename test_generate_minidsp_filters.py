@@ -8,6 +8,135 @@ import generate_minidsp_filters as gen
 
 
 class GenerateMiniDSPFiltersTests(unittest.TestCase):
+    def test_multipoint_dataset_preserves_positions_and_provides_average(self):
+        freq = np.asarray([100.0, 200.0])
+        responses = {
+            "left": [
+                np.asarray([1.0 + 0.0j, 2.0 + 0.0j]),
+                np.asarray([3.0 + 0.0j, 4.0 + 0.0j]),
+            ],
+            "right": [
+                np.asarray([2.0 + 0.0j, 2.0 + 0.0j]),
+                np.asarray([4.0 + 0.0j, 4.0 + 0.0j]),
+            ],
+        }
+
+        dataset = gen.MultiPointResponses(freq=freq, responses=responses)
+
+        self.assertEqual(dataset.position_count("left"), 2)
+        self.assertEqual(dataset.position_count("right"), 2)
+        self.assertEqual(dataset.position_count(), 2)
+        np.testing.assert_allclose(dataset.average("left"), np.asarray([2.0 + 0.0j, 3.0 + 0.0j]))
+        self.assertEqual(len(dataset.training_indices(held_out=1)), 1)
+        self.assertEqual(dataset.training_indices(held_out=1), [0])
+
+    def test_impulse_to_frequency_response_recovers_delayed_impulse_phase(self):
+        impulse = gen.ImpulseMeasurement(
+            name="unit",
+            path=Path("unit.txt"),
+            peak_value=1.0,
+            peak_index=2,
+            length=8,
+            sample_interval=1.0 / 8.0,
+            start_time=0.0,
+            samples=np.asarray([0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0]),
+        )
+        freq = np.asarray([0.0, 1.0, 2.0])
+
+        response = gen.impulse_to_frequency_response(impulse, freq)
+
+        expected = np.exp(-1j * 2.0 * np.pi * freq * (2.0 / 8.0))
+        np.testing.assert_allclose(response, expected, atol=1e-12)
+
+    def test_frontier_fir_respects_frequency_boost_cap(self):
+        freq = np.geomspace(20.0, 500.0, 80)
+        measured_positions = [
+            np.ones_like(freq, dtype=np.complex128) * (10.0 ** (-8.0 / 20.0)),
+            np.ones_like(freq, dtype=np.complex128) * (10.0 ** (-4.0 / 20.0)),
+        ]
+        target_db = np.zeros_like(freq)
+        mask = (freq >= 40.0) & (freq <= 300.0)
+        cap = np.full_like(freq, 2.0)
+
+        fir, metadata = gen.make_frontier_fir(
+            freq,
+            measured_positions,
+            target_db,
+            taps=48,
+            correction_mask=mask,
+            grid_points=96,
+            max_boost_db=2.0,
+            max_cut_db=10.0,
+            boost_cap_db=cap,
+            max_filter_energy_db=18.0,
+            pre_ringing_limit_db=-18.0,
+        )
+
+        response_db = gen.db(gen.fir_response(fir, freq))
+        self.assertEqual(fir.shape, (48,))
+        self.assertEqual(metadata["method"], "cvxpy")
+        self.assertLessEqual(float(np.max(response_db[mask])), 2.35)
+        self.assertTrue(np.all(np.isfinite(fir)))
+
+    def test_multipoint_score_uses_80th_percentile_not_only_average(self):
+        freq = np.asarray([80.0, 100.0, 120.0])
+        target = np.zeros_like(freq)
+        good_everywhere = [
+            np.ones_like(freq, dtype=np.complex128),
+            np.ones_like(freq, dtype=np.complex128) * (10.0 ** (1.0 / 20.0)),
+            np.ones_like(freq, dtype=np.complex128) * (10.0 ** (-1.0 / 20.0)),
+        ]
+        bad_one_seat = [
+            np.ones_like(freq, dtype=np.complex128) * (10.0 ** (-2.0 / 20.0)),
+            np.ones_like(freq, dtype=np.complex128) * (10.0 ** (-2.0 / 20.0)),
+            np.ones_like(freq, dtype=np.complex128) * (10.0 ** (8.0 / 20.0)),
+        ]
+        mask = np.ones_like(freq, dtype=bool)
+
+        good = gen.multipoint_magnitude_score(good_everywhere, target, mask)
+        bad = gen.multipoint_magnitude_score(bad_one_seat, target, mask)
+
+        self.assertLess(good["score"], bad["score"])
+        self.assertGreater(bad["p80_rms_db"], bad["median_rms_db"])
+
+    def test_frontier_final_system_records_multipoint_fir_metrics(self):
+        freq = np.geomspace(40.0, 500.0, 80)
+        target = np.zeros_like(freq)
+        flat = np.ones_like(freq, dtype=np.complex128)
+        responses = {
+            "left": [flat.copy(), flat * (10.0 ** (-1.0 / 20.0))],
+            "right": [flat.copy(), flat * (10.0 ** (1.0 / 20.0))],
+            "sub": [flat.copy(), flat * (10.0 ** (-2.0 / 20.0))],
+            "left_sum": [flat * 2.0, flat * 2.0],
+            "right_sum": [flat * 2.0, flat * 2.0],
+        }
+        multipoint = gen.MultiPointResponses(freq=freq, responses=responses)
+        avg = {key: multipoint.average(key) for key in responses}
+        original_taps = dict(gen.FIR_TAPS)
+        try:
+            gen.FIR_TAPS.update({"left": 48, "right": 48, "sub": 48})
+            system = gen.build_final_filter_system(
+                freq=freq,
+                avg=avg,
+                target_db=target,
+                crossover={"crossover_hz": 100.0, "sub_delay_ms": 0.0, "sub_gain_db": 0.0},
+                sub_low_freq=40.0,
+                sub_highpass_hz=0.0,
+                fir_ls_grid_points=96,
+                fir_ls_max_boost_db=2.0,
+                optimizer_mode="frontier",
+                multipoint=multipoint,
+                gain_refinement_enabled=False,
+            )
+        finally:
+            gen.FIR_TAPS.clear()
+            gen.FIR_TAPS.update(original_taps)
+
+        for result in system["results"]:
+            self.assertEqual(result.fir_requested_method, "frontier")
+            self.assertEqual(result.fir_used_method, "frontier cvxpy")
+            self.assertIn("multipoint_score", result.fir_metrics)
+
     def test_complex_from_spl_trust_exports_does_not_apply_mic_correction(self):
         measurement = gen.SPLMeasurement(
             name="L 1",
