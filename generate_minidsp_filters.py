@@ -90,6 +90,7 @@ class ChannelResult:
     key: str
     title: str
     peq: List[Biquad]
+    peq_optimization: Dict[str, object]
     fir: np.ndarray
     gain_db: float
     delay_ms: float
@@ -98,6 +99,24 @@ class ChannelResult:
     rms_after_db: float
     max_boost_db: float
     max_cut_db: float
+
+
+@dataclass
+class PeakOptimizationResult:
+    filters: List[Biquad]
+    seed_rms_db: float
+    refined_rms_db: float
+    success: bool
+
+
+@dataclass
+class PeqOptimizationResult:
+    filters: List[Biquad]
+    seed_rms_db: float
+    refined_rms_db: float
+    success: bool
+    message: str
+    nfev: int
 
 
 def clean_number(token: str) -> float:
@@ -572,11 +591,22 @@ def optimize_crossover(
             for gain_db in np.arange(coarse["sub_gain_db"] - 0.75, coarse["sub_gain_db"] + 0.7501, 0.125):
                 consider(float(fc), float(delay_ms), float(gain_db))
     assert best is not None
-    best["top_candidates"] = sorted(candidates, key=lambda row: row["score"])[:50]
+    sorted_candidates = sorted(candidates, key=lambda row: row["score"])
+    diverse_by_fc: Dict[float, Dict[str, float]] = {}
+    for row in sorted_candidates:
+        fc_key = round(row["crossover_hz"] * 2.0) / 2.0
+        diverse_by_fc.setdefault(fc_key, row)
+    top_candidates = list(sorted_candidates[:50])
+    top_candidates.extend(diverse_by_fc.values())
+    deduped: Dict[Tuple[float, float, float], Dict[str, float]] = {}
+    for row in top_candidates:
+        key = (row["crossover_hz"], row["sub_delay_ms"], row["sub_gain_db"])
+        deduped[key] = row
+    best["top_candidates"] = sorted(deduped.values(), key=lambda row: row["score"])[:120]
     return best
 
 
-def find_peak_filters(
+def seed_peak_filters(
     freq: np.ndarray,
     response: np.ndarray,
     target_db: np.ndarray,
@@ -601,7 +631,7 @@ def find_peak_filters(
         if cut_amount >= 2.0 and cut_amount >= boost_amount * 0.65:
             idx = cut_idx
             gain = -float(np.clip(cut_amount * 0.75, 1.0, 9.0))
-        elif boost_amount >= 3.0:
+        elif boost_amount >= 2.0:
             idx = boost_idx
             # Boost gently and avoid trying to fill nulls.
             gain = float(np.clip(boost_amount * 0.35, 0.5, 3.0))
@@ -644,6 +674,187 @@ def find_peak_filters(
     return filters
 
 
+def _require_least_squares():
+    try:
+        from scipy.optimize import least_squares
+    except ImportError as exc:
+        raise RuntimeError(
+            "SciPy is required for bounded PEQ least-squares refinement. "
+            "Install dependencies with: python3 -m pip install -r requirements.txt"
+        ) from exc
+    return least_squares
+
+
+def _peq_rms_error(
+    filters: Sequence[Biquad],
+    freq: np.ndarray,
+    base_db: np.ndarray,
+    target_db: np.ndarray,
+) -> float:
+    corrected_db = base_db + db(cascade_response(filters, freq))
+    return rms(corrected_db - target_db)
+
+
+def optimize_peak_filters(
+    freq: np.ndarray,
+    response: np.ndarray,
+    target_db: np.ndarray,
+    correction_mask: np.ndarray,
+    seed_filters: Sequence[Biquad],
+    distortion: Dict[str, np.ndarray] | None = None,
+    fs: float = OUT_FS,
+) -> PeqOptimizationResult:
+    """Refine all PEQ parameters together with bounded robust least squares."""
+    if not seed_filters:
+        masked = correction_mask.astype(bool)
+        base_db = db(response[masked])
+        return PeqOptimizationResult([], rms(base_db - target_db[masked]), rms(base_db - target_db[masked]), True, "No seed filters.", 0)
+
+    least_squares = _require_least_squares()
+    mask = correction_mask.astype(bool)
+    fit_freq = freq[mask]
+    if fit_freq.size < 3:
+        return PeqOptimizationResult(list(seed_filters), float("nan"), float("nan"), False, "Correction mask is too small.", 0)
+
+    lo_freq = float(np.min(fit_freq))
+    hi_freq = float(np.max(fit_freq))
+    grid_points = min(512, fit_freq.size)
+    fit_grid = np.geomspace(lo_freq, hi_freq, grid_points)
+    base_db = np.interp(fit_grid, freq, db(response))
+    fit_target_db = np.interp(fit_grid, freq, target_db)
+
+    q_min, q_max = 0.35, 8.0
+    gain_min, gain_max = -9.0, 3.0
+    distortion_freq = None
+    distortion_thd = None
+    if distortion is not None and "freq" in distortion and "thd_pct" in distortion:
+        distortion_freq = np.asarray(distortion["freq"], dtype=np.float64)
+        distortion_thd = np.asarray(distortion["thd_pct"], dtype=np.float64)
+
+    x0: List[float] = []
+    lower: List[float] = []
+    upper: List[float] = []
+    for filt in seed_filters:
+        clipped_freq = float(np.clip(filt.freq, lo_freq, hi_freq))
+        clipped_q = float(np.clip(filt.q, q_min, q_max))
+        filter_gain_max = gain_max
+        if distortion_freq is not None and distortion_thd is not None and clipped_freq < 25.0:
+            thd = float(
+                np.interp(
+                    clipped_freq,
+                    distortion_freq,
+                    distortion_thd,
+                    left=distortion_thd[0],
+                    right=distortion_thd[-1],
+                )
+            )
+            if thd > 5.0:
+                filter_gain_max = 1.0
+        clipped_gain = float(np.clip(filt.gain_db, gain_min, filter_gain_max))
+        x0.extend([math.log2(clipped_freq), math.log(clipped_q), clipped_gain])
+        lower.extend([math.log2(lo_freq), math.log(q_min), gain_min])
+        upper.extend([math.log2(hi_freq), math.log(q_max), filter_gain_max])
+
+    def decode(params: np.ndarray) -> List[Biquad]:
+        filters: List[Biquad] = []
+        for idx in range(0, params.size, 3):
+            centre = 2.0 ** float(params[idx])
+            q = math.exp(float(params[idx + 1]))
+            gain = float(params[idx + 2])
+            filters.append(biquad_peak(centre, gain, q, fs))
+        return filters
+
+    seed_for_fallback = decode(np.asarray(x0, dtype=np.float64))
+    seed_rms = _peq_rms_error(seed_for_fallback, fit_grid, base_db, fit_target_db)
+
+    def penalty_residuals(filters: Sequence[Biquad]) -> List[float]:
+        penalties: List[float] = []
+        for filt in filters:
+            boost = max(filt.gain_db, 0.0)
+            penalties.append(boost / 8.0)
+            penalties.append(max(filt.q - 4.0, 0.0) / 3.0)
+            if distortion_freq is not None and distortion_thd is not None:
+                thd = float(
+                    np.interp(
+                        filt.freq,
+                        distortion_freq,
+                        distortion_thd,
+                        left=distortion_thd[0],
+                        right=distortion_thd[-1],
+                    )
+                )
+                low_freq_risk = max(0.0, (25.0 - filt.freq) / 10.0)
+                thd_risk = max(0.0, (thd - 5.0) / 5.0)
+                penalties.append(boost * low_freq_risk * thd_risk * 6.0)
+        for left_idx, left in enumerate(filters):
+            for right in filters[left_idx + 1 :]:
+                spacing_oct = abs(math.log2(left.freq / right.freq))
+                penalties.append(max((1.0 / 3.0) - spacing_oct, 0.0) * 3.0)
+        return penalties
+
+    def residuals(params: np.ndarray) -> np.ndarray:
+        filters = decode(params)
+        corrected_db = base_db + db(cascade_response(filters, fit_grid, fs))
+        response_residual = corrected_db - fit_target_db
+        return np.r_[response_residual, np.asarray(penalty_residuals(filters), dtype=np.float64)]
+
+    result = least_squares(
+        residuals,
+        np.asarray(x0, dtype=np.float64),
+        bounds=(np.asarray(lower), np.asarray(upper)),
+        loss="soft_l1",
+        f_scale=1.5,
+        max_nfev=900,
+    )
+    all_filters = [filt for filt in decode(result.x) if abs(filt.gain_db) >= 0.1]
+    stable_filters = [filt for filt in all_filters if filt.is_stable()]
+    refined_rms = _peq_rms_error(stable_filters, fit_grid, base_db, fit_target_db)
+    if not stable_filters and seed_filters:
+        refined_rms = rms(base_db - fit_target_db)
+    if not np.isfinite(refined_rms) or refined_rms > seed_rms:
+        stable_filters = seed_for_fallback
+        refined_rms = seed_rms
+    accepted = bool(result.success) or bool(np.isfinite(refined_rms) and refined_rms <= seed_rms)
+    return PeqOptimizationResult(
+        filters=stable_filters,
+        seed_rms_db=seed_rms,
+        refined_rms_db=refined_rms,
+        success=accepted,
+        message=str(result.message),
+        nfev=int(result.nfev),
+    )
+
+
+def find_peak_filters(
+    freq: np.ndarray,
+    response: np.ndarray,
+    target_db: np.ndarray,
+    correction_mask: np.ndarray,
+    max_filters: int = MAX_PEQ_FILTERS,
+    distortion: Dict[str, np.ndarray] | None = None,
+) -> List[Biquad]:
+    seed = seed_peak_filters(freq, response, target_db, correction_mask, max_filters)
+    return optimize_peak_filters(freq, response, target_db, correction_mask, seed, distortion).filters
+
+
+def peq_optimization_metadata(result: PeqOptimizationResult) -> Dict[str, object]:
+    return {
+        "method": "scipy.optimize.least_squares",
+        "loss": "soft_l1",
+        "f_scale_db": 1.5,
+        "bounds": {
+            "q": [0.35, 8.0],
+            "gain_db": [-9.0, 3.0],
+            "frequency_hz": "channel correction mask",
+        },
+        "seed_rms_db": result.seed_rms_db,
+        "refined_rms_db": result.refined_rms_db,
+        "success": result.success,
+        "message": result.message,
+        "nfev": result.nfev,
+    }
+
+
 def make_fir(
     freq: np.ndarray,
     residual_db: np.ndarray,
@@ -683,6 +894,112 @@ def make_fir(
     return fir.astype(np.float64)
 
 
+def design_fir_frequency_grid(
+    freq: np.ndarray,
+    correction_mask: np.ndarray,
+    fs: float = OUT_FS,
+    grid_points: int = 1024,
+) -> np.ndarray:
+    if grid_points < 32:
+        raise ValueError("--fir-ls-grid-points must be at least 32")
+    positive_freq = freq[freq > 0.0]
+    low = max(float(positive_freq[0]), 1.0)
+    high = min(float(freq[-1]), fs * 0.5 * 0.98)
+    if np.any(correction_mask):
+        active_freq = freq[correction_mask]
+        low = min(low, max(float(active_freq[0]) * 0.5, 1.0))
+        high = max(high, min(float(active_freq[-1]) * 1.35, fs * 0.5 * 0.98))
+    grid = np.geomspace(low, high, grid_points)
+    anchors = np.asarray([0.0, low, high, fs * 0.5], dtype=np.float64)
+    return np.unique(np.r_[anchors, grid])
+
+
+def interp_complex(freq: np.ndarray, response: np.ndarray, design_freq: np.ndarray) -> np.ndarray:
+    real = np.interp(design_freq, freq, np.real(response), left=np.real(response[0]), right=np.real(response[-1]))
+    imag = np.interp(design_freq, freq, np.imag(response), left=np.imag(response[0]), right=np.imag(response[-1]))
+    return real + 1j * imag
+
+
+def second_difference_matrix(taps: int) -> np.ndarray:
+    if taps < 3:
+        return np.zeros((0, taps), dtype=np.float64)
+    d = np.zeros((taps - 2, taps), dtype=np.float64)
+    rows = np.arange(taps - 2)
+    d[rows, rows] = 1.0
+    d[rows, rows + 1] = -2.0
+    d[rows, rows + 2] = 1.0
+    return d
+
+
+def solve_real_complex_lstsq(
+    matrix: np.ndarray,
+    target: np.ndarray,
+    regularizer: np.ndarray,
+    lambda_reg: float,
+) -> np.ndarray:
+    real_system = np.vstack([np.real(matrix), np.imag(matrix)])
+    real_target = np.r_[np.real(target), np.imag(target)]
+    if lambda_reg > 0.0 and regularizer.size:
+        scale = math.sqrt(lambda_reg)
+        real_system = np.vstack([real_system, scale * regularizer])
+        real_target = np.r_[real_target, np.zeros(regularizer.shape[0], dtype=np.float64)]
+    solution, *_ = np.linalg.lstsq(real_system, real_target, rcond=None)
+    return np.asarray(solution, dtype=np.float64)
+
+
+def make_fir_ls(
+    freq: np.ndarray,
+    measured_response: np.ndarray,
+    target_db: np.ndarray,
+    taps: int,
+    correction_mask: np.ndarray,
+    fs: float = OUT_FS,
+    grid_points: int = 1024,
+    lambda_reg: float = 0.01,
+    max_boost_db: float = 3.0,
+    max_cut_db: float = 10.0,
+) -> np.ndarray:
+    if taps <= 0:
+        raise ValueError("FIR tap count must be positive")
+    if lambda_reg < 0.0:
+        raise ValueError("--fir-ls-lambda must be non-negative")
+    if max_boost_db < 0.0 or max_cut_db < 0.0:
+        raise ValueError("FIR boost/cut guardrails must be non-negative")
+
+    design_freq = design_fir_frequency_grid(freq, correction_mask, fs=fs, grid_points=grid_points)
+    measured = interp_complex(freq, measured_response, design_freq)
+    target = np.interp(design_freq, freq, target_db, left=target_db[0], right=target_db[-1])
+    active = np.interp(design_freq, freq, correction_mask.astype(np.float64), left=0.0, right=0.0) >= 0.5
+
+    measured_db = db(measured)
+    correction_db = np.clip(target - measured_db, -max_cut_db, max_boost_db)
+    desired_active_db = measured_db + correction_db
+    delay_samples = (taps - 1) / 2.0
+    delay_phase = np.exp(-1j * 2.0 * np.pi * design_freq * (delay_samples / fs))
+
+    desired = measured * delay_phase
+    desired[active] = (10.0 ** (desired_active_db[active] / 20.0)) * delay_phase[active]
+
+    confidence = np.ones_like(design_freq, dtype=np.float64) * 0.08
+    confidence[active] = 1.0
+    confidence *= np.clip(np.abs(measured) / np.percentile(np.abs(measured), 75), 0.1, 1.0)
+    weights = np.sqrt(confidence)
+
+    n = np.arange(taps, dtype=np.float64)
+    fourier = np.exp(-1j * 2.0 * np.pi * np.outer(design_freq / fs, n))
+    safe_measured = np.where(np.abs(measured) > EPS, measured, EPS + 0.0j)
+    correction_target = desired / safe_measured
+    system = fourier * weights[:, None]
+    weighted_target = correction_target * weights
+    fir = solve_real_complex_lstsq(
+        system,
+        weighted_target,
+        second_difference_matrix(taps),
+        lambda_reg=lambda_reg,
+    )
+
+    return fir.astype(np.float64)
+
 def fir_response(fir: np.ndarray, freq: np.ndarray, fs: float = OUT_FS) -> np.ndarray:
     n = np.arange(fir.size)
     return np.exp(-1j * 2.0 * np.pi * np.outer(freq / fs, n)) @ fir
@@ -713,6 +1030,132 @@ def apply_output_delay(response: np.ndarray, freq: np.ndarray, delay_ms: float) 
     return response * np.exp(-1j * 2.0 * np.pi * freq * (delay_ms / 1000.0))
 
 
+def phase_alignment_penalty(
+    freq: np.ndarray,
+    main: np.ndarray,
+    sub: np.ndarray,
+    crossover_hz: float,
+) -> float:
+    mask = (freq >= crossover_hz / math.sqrt(2.0)) & (freq <= crossover_hz * math.sqrt(2.0))
+    if not np.any(mask):
+        return 0.0
+    main_db = db(main)
+    sub_db = db(sub)
+    overlap = mask & (np.abs(main_db - sub_db) <= 12.0)
+    if np.count_nonzero(overlap) < 2:
+        overlap = mask
+    phase_error = np.angle(main[overlap] * np.conj(sub[overlap]))
+    weights = np.minimum(np.abs(main[overlap]), np.abs(sub[overlap]))
+    if float(np.sum(weights)) <= EPS:
+        return 0.0
+    return float(np.sqrt(np.average(np.square(phase_error / np.pi), weights=weights)))
+
+
+def score_final_system_candidate(
+    freq: np.ndarray,
+    final_channels: Dict[str, np.ndarray],
+    lsum_measured: np.ndarray,
+    rsum_measured: np.ndarray,
+    target_db: np.ndarray,
+    crossover_hz: float,
+    crossover_preference_hz: float | None = None,
+) -> Dict[str, float]:
+    pred_lsum = final_channels["left"] + final_channels["sub"]
+    pred_rsum = final_channels["right"] + final_channels["sub"]
+    score_mask = (freq >= 50.0) & (freq <= 160.0)
+    if np.count_nonzero(score_mask) < 3:
+        score_mask = np.ones_like(freq, dtype=bool)
+
+    target_rms = rms(
+        np.r_[
+            db(pred_lsum[score_mask]) - target_db[score_mask],
+            db(pred_rsum[score_mask]) - target_db[score_mask],
+        ]
+    )
+    lr_mismatch = rms(db(pred_lsum[score_mask]) - db(pred_rsum[score_mask]))
+    validation_rms = rms(
+        np.r_[
+            db(pred_lsum[score_mask]) - db(lsum_measured[score_mask]),
+            db(pred_rsum[score_mask]) - db(rsum_measured[score_mask]),
+        ]
+    )
+
+    left_cancellation = db(pred_lsum) - np.maximum(db(final_channels["left"]), db(final_channels["sub"]))
+    right_cancellation = db(pred_rsum) - np.maximum(db(final_channels["right"]), db(final_channels["sub"]))
+    cancellation_penalty = float(
+        np.sqrt(
+            np.mean(
+                np.square(
+                    np.r_[
+                        np.minimum(left_cancellation[score_mask] + 1.0, 0.0),
+                        np.minimum(right_cancellation[score_mask] + 1.0, 0.0),
+                    ]
+                )
+            )
+        )
+    )
+    phase_penalty = 0.5 * (
+        phase_alignment_penalty(freq, final_channels["left"], final_channels["sub"], crossover_hz)
+        + phase_alignment_penalty(freq, final_channels["right"], final_channels["sub"], crossover_hz)
+    )
+    preference_penalty = (
+        abs(math.log2(crossover_hz / crossover_preference_hz))
+        if crossover_preference_hz is not None
+        else 0.0
+    )
+    score = (
+        target_rms
+        + 0.35 * lr_mismatch
+        + 0.25 * validation_rms
+        + 0.4 * cancellation_penalty
+        + 0.5 * phase_penalty
+        + preference_penalty
+    )
+    return {
+        "score": float(score),
+        "target_rms_db": float(target_rms),
+        "lr_mismatch_rms_db": float(lr_mismatch),
+        "validation_rms_db": float(validation_rms),
+        "cancellation_penalty": float(cancellation_penalty),
+        "phase_penalty": float(phase_penalty),
+        "preference_penalty": float(preference_penalty),
+    }
+
+
+def select_exact_crossover_candidate(
+    candidates: Sequence[Dict[str, float]],
+    exact_scorer,
+    max_candidates: int = 8,
+) -> Dict[str, float]:
+    shortlist: List[Dict[str, float]] = []
+    sorted_candidates = sorted(candidates, key=lambda row: row["score"])
+    for candidate in sorted_candidates:
+        if len(shortlist) >= max_candidates:
+            break
+        if all(abs(candidate["crossover_hz"] - existing["crossover_hz"]) >= 2.0 for existing in shortlist):
+            shortlist.append(candidate)
+    for candidate in sorted_candidates:
+        if len(shortlist) >= max_candidates:
+            break
+        if candidate not in shortlist:
+            shortlist.append(candidate)
+
+    exact_rows: List[Dict[str, float]] = []
+    for candidate in shortlist:
+        exact = exact_scorer(candidate)
+        row = dict(candidate)
+        row["proxy_score"] = float(candidate["score"])
+        row["exact_score"] = float(exact["score"])
+        row["score"] = float(exact["score"])
+        for key, value in exact.items():
+            row[f"exact_{key}"] = float(value)
+        exact_rows.append(row)
+
+    best = dict(min(exact_rows, key=lambda row: row["exact_score"]))
+    best["top_candidates"] = sorted(exact_rows, key=lambda row: row["exact_score"])
+    return best
+
+
 def correction_masks(
     freq: np.ndarray, crossover_hz: float, sub_low_freq: float = 20.0
 ) -> Dict[str, np.ndarray]:
@@ -720,6 +1163,109 @@ def correction_masks(
         "left": (freq >= max(crossover_hz * 0.85, 60.0)) & (freq <= 18_000.0),
         "right": (freq >= max(crossover_hz * 0.85, 60.0)) & (freq <= 18_000.0),
         "sub": (freq >= sub_low_freq) & (freq <= min(crossover_hz * 1.8, 180.0)),
+    }
+
+
+def build_final_filter_system(
+    freq: np.ndarray,
+    avg: Dict[str, np.ndarray],
+    target_db: np.ndarray,
+    crossover: Dict[str, float],
+    sub_low_freq: float,
+    sub_highpass_hz: float,
+    distortion: Dict[str, np.ndarray] | None = None,
+    fir_method: str = "legacy",
+    fir_ls_grid_points: int = 1024,
+    fir_ls_lambda: float = 0.01,
+    fir_ls_max_boost_db: float = 3.0,
+    fir_ls_max_cut_db: float = 10.0,
+) -> Dict[str, object]:
+    fc = float(crossover["crossover_hz"])
+    masks = correction_masks(freq, fc, sub_low_freq=sub_low_freq)
+    hp = cascade_response(lr4_filters(fc, "hp"), freq)
+    lp = cascade_response(lr4_filters(fc, "lp"), freq)
+    sub_hp_filters = [biquad_highpass(sub_highpass_hz)] if sub_highpass_hz > 0 else []
+    sub_hp = cascade_response(sub_hp_filters, freq)
+    xover = {"left": hp, "right": hp, "sub": lp * sub_hp}
+    delays = translate_relative_delay_to_outputs(
+        float(crossover["sub_delay_ms"]),
+        main_taps=FIR_TAPS["left"],
+        sub_taps=FIR_TAPS["sub"],
+        fs=OUT_FS,
+    )
+    gains = {
+        "left": choose_channel_gain(freq, avg["left"] * hp, target_db, masks["left"]),
+        "right": choose_channel_gain(freq, avg["right"] * hp, target_db, masks["right"]),
+        "sub": float(crossover["sub_gain_db"])
+        + choose_channel_gain(freq, avg["sub"] * lp * sub_hp, target_db, masks["sub"], headroom_db=-3.0),
+    }
+
+    results: List[ChannelResult] = []
+    corrected: Dict[str, np.ndarray] = {}
+    final_channels: Dict[str, np.ndarray] = {}
+    for key, title in [("left", "Left"), ("right", "Right"), ("sub", "Sub")]:
+        base = avg[key] * xover[key] * 10.0 ** (gains[key] / 20.0)
+        seed = seed_peak_filters(freq, base, target_db, masks[key], MAX_PEQ_FILTERS)
+        peq_result = optimize_peak_filters(freq, base, target_db, masks[key], seed, distortion)
+        peq = peq_result.filters
+        peq_resp = cascade_response(peq, freq)
+        after_peq = base * peq_resp
+        residual = target_db - db(after_peq)
+        if fir_method == "ls":
+            fir = make_fir_ls(
+                freq,
+                after_peq,
+                target_db,
+                FIR_TAPS[key],
+                masks[key],
+                grid_points=fir_ls_grid_points,
+                lambda_reg=fir_ls_lambda,
+                max_boost_db=fir_ls_max_boost_db,
+                max_cut_db=fir_ls_max_cut_db,
+            )
+        elif fir_method == "legacy":
+            fir = make_fir(freq, residual, FIR_TAPS[key], masks[key])
+        else:
+            raise ValueError(f"Unsupported FIR method: {fir_method}")
+        f_resp = fir_response(fir, freq)
+        after_all = after_peq * f_resp
+        corrected[key] = after_all
+        final_channels[key] = apply_output_delay(after_all, freq, delays[key])
+        max_boost, max_cut = summarize_filters(peq)
+        before_err = db(base[masks[key]]) - target_db[masks[key]]
+        after_err = db(after_all[masks[key]]) - target_db[masks[key]]
+        results.append(
+            ChannelResult(
+                key=key,
+                title=title,
+                peq=peq,
+                peq_optimization=peq_optimization_metadata(peq_result),
+                fir=fir,
+                gain_db=gains[key],
+                delay_ms=delays[key],
+                fir_taps=FIR_TAPS[key],
+                rms_before_db=rms(before_err),
+                rms_after_db=rms(after_err),
+                max_boost_db=max_boost,
+                max_cut_db=max_cut,
+            )
+        )
+
+    return {
+        "fc": fc,
+        "masks": masks,
+        "sub_hp_filters": sub_hp_filters,
+        "xover": xover,
+        "delays": delays,
+        "gains": gains,
+        "results": results,
+        "corrected": corrected,
+        "final_channels": final_channels,
+        "crossover_filters": {
+            "left": lr4_filters(fc, "hp"),
+            "right": lr4_filters(fc, "hp"),
+            "sub": lr4_filters(fc, "lp") + sub_hp_filters,
+        },
     }
 
 
@@ -800,10 +1346,18 @@ def write_rows_csv(path: Path, rows: Sequence[Dict[str, float]]) -> None:
     if not rows:
         path.write_text("\n")
         return
-    header = list(rows[0].keys())
+    header = sorted({name for row in rows for name in row.keys()})
+
+    def format_value(value: object) -> str:
+        if isinstance(value, (int, float, np.integer, np.floating)):
+            return f"{float(value):.6f}"
+        if isinstance(value, (list, tuple, dict)):
+            return json.dumps(value, sort_keys=True).replace('"', '""')
+        return str(value).replace('"', '""')
+
     lines = [",".join(header)]
     for row in rows:
-        lines.append(",".join(f"{row[name]:.6f}" for name in header))
+        lines.append(",".join(f'"{format_value(row.get(name, ""))}"' for name in header))
     path.write_text("\n".join(lines) + "\n")
 
 
@@ -832,6 +1386,8 @@ def build_report(
     mic_compare_note: str,
     boundary_warning: str,
     midbass_rows: Sequence[Dict[str, float]],
+    fir_method: str,
+    fir_ls_settings: Dict[str, float],
 ) -> None:
     lines: List[str] = []
     lines.append("# miniDSP 2x4 HD Filter Report")
@@ -851,8 +1407,17 @@ def build_report(
     if boundary_warning:
         lines.append(f"- Crossover search warning: {boundary_warning}")
     lines.append(f"- Mic calibration policy: {mic_cal_policy}. {mic_compare_note}")
+    lines.append("- PEQ selection: greedy seeds refined with bounded SciPy soft-L1 least squares.")
+    if fir_method == "ls":
+        lines.append(
+            "- FIR solver: weighted regularized least-squares acoustic inverse "
+            f"({fir_ls_settings['grid_points']:.0f} design points, lambda {fir_ls_settings['lambda_reg']:.4g}, "
+            f"boost/cut guardrails +{fir_ls_settings['max_boost_db']:.1f}/-{fir_ls_settings['max_cut_db']:.1f} dB)."
+        )
+    else:
+        lines.append("- FIR solver: legacy smoothed magnitude inverse via frequency sampling and windowed truncation.")
     lines.append(
-        f"- FIR group delay compensation: Sub FIR is "
+        f"- FIR target delay compensation: Sub FIR target delay is "
         f"{fir_group_delay_ms(FIR_TAPS['sub']) - fir_group_delay_ms(FIR_TAPS['left']):.3f} ms "
         "longer than the Left/Right FIRs, included in the output delay settings below."
     )
@@ -962,7 +1527,7 @@ def build_report(
         "- These filters are derived from exported in-room measurements. Verify at low volume first, then remeasure through the miniDSP."
     )
     lines.append(
-        "- The FIR filters are linear-phase residual magnitude corrections; output delay handles the main timing alignment."
+        "- The FIR files are generated as matched acoustic correction filters; output delay handles the main timing alignment."
     )
     if mic_cal_policy == "apply":
         lines.append("- Microphone Correction.txt was applied to the exported SPL data.")
@@ -979,6 +1544,7 @@ def write_settings_summary(
     results: Sequence[ChannelResult],
     sub_highpass_hz: float,
     sub_low_freq: float,
+    fir_method: str,
 ) -> None:
     lines = [
         "miniDSP 2x4 HD settings summary",
@@ -1007,6 +1573,7 @@ def write_settings_summary(
             f"Sub FIR group delay is {fir_group_delay_ms(FIR_TAPS['sub']):.3f} ms.",
             f"Left/Right FIR group delay is {fir_group_delay_ms(FIR_TAPS['left']):.3f} ms.",
             "The output delays above include this difference.",
+            f"FIR solver: {'weighted regularized least-squares acoustic inverse' if fir_method == 'ls' else 'legacy smoothed magnitude inverse'}",
             "",
             "FIR imports:",
             "File Mode binary:",
@@ -1019,6 +1586,7 @@ def write_settings_summary(
             f"Sub: fir_sub_96k_{FIR_TAPS['sub']}taps_manual.txt",
             "",
             "PEQ imports:",
+            "PEQ selection: greedy seeds refined with bounded SciPy soft-L1 least squares.",
             "Left: peq_left.txt",
             "Right: peq_right.txt",
             "Sub: peq_sub.txt",
@@ -1076,6 +1644,36 @@ def main() -> int:
             "'apply' preserves the legacy behavior, and 'compare' reports the difference but generates "
             "filters from trusted exports."
         ),
+    )
+    parser.add_argument(
+        "--fir-method",
+        choices=("ls", "legacy"),
+        default="ls",
+        help="FIR design method. 'ls' uses weighted regularized least-squares; 'legacy' uses the old windowed inverse.",
+    )
+    parser.add_argument(
+        "--fir-ls-grid-points",
+        type=int,
+        default=1024,
+        help="Number of log-spaced frequency design points for --fir-method ls.",
+    )
+    parser.add_argument(
+        "--fir-ls-lambda",
+        type=float,
+        default=0.01,
+        help="Second-difference regularization strength for --fir-method ls.",
+    )
+    parser.add_argument(
+        "--fir-ls-max-boost-db",
+        type=float,
+        default=3.0,
+        help="Maximum FIR boost requested by the LS target before solving.",
+    )
+    parser.add_argument(
+        "--fir-ls-max-cut-db",
+        type=float,
+        default=10.0,
+        help="Maximum FIR cut requested by the LS target before solving.",
     )
     args = parser.parse_args()
 
@@ -1142,8 +1740,14 @@ def main() -> int:
 
     shift = 0.0 if args.absolute_target else target_shift(freq, target_db, avg["left"], avg["right"])
     shifted_target_db = target_db + shift
+    fir_ls_settings = {
+        "grid_points": float(args.fir_ls_grid_points),
+        "lambda_reg": float(args.fir_ls_lambda),
+        "max_boost_db": float(args.fir_ls_max_boost_db),
+        "max_cut_db": float(args.fir_ls_max_cut_db),
+    }
 
-    crossover = optimize_crossover(
+    proxy_crossover = optimize_crossover(
         freq=freq,
         left=avg["left"],
         right=avg["right"],
@@ -1156,67 +1760,55 @@ def main() -> int:
         crossover_preference_hz=args.prefer_crossover,
         sub_highpass_hz=args.sub_highpass_hz,
     )
-    fc = crossover["crossover_hz"]
-    masks = correction_masks(freq, fc, sub_low_freq=args.sub_low_freq)
+    system_cache: Dict[Tuple[float, float, float], Dict[str, object]] = {}
 
-    hp = cascade_response(lr4_filters(fc, "hp"), freq)
-    lp = cascade_response(lr4_filters(fc, "lp"), freq)
-    sub_hp_filters = [biquad_highpass(args.sub_highpass_hz)] if args.sub_highpass_hz > 0 else []
-    sub_hp = cascade_response(sub_hp_filters, freq)
-    xover = {"left": hp, "right": hp, "sub": lp * sub_hp}
-
-    # Translate the acoustic sub-vs-main delay target into output delay fields.
-    # The FIR files are causal linear-phase filters, so unequal tap counts add
-    # unequal group delays. The sub FIR is longer than the mains FIR, and that
-    # extra FIR delay must be compensated in the output delays.
-    delays = translate_relative_delay_to_outputs(
-        crossover["sub_delay_ms"],
-        main_taps=FIR_TAPS["left"],
-        sub_taps=FIR_TAPS["sub"],
-        fs=OUT_FS,
-    )
-
-    # The right speaker's measured timing is close enough to left that forcing a
-    # right-only delay from the noisy in-room impulse would add false precision.
-    gains = {
-        "left": choose_channel_gain(freq, avg["left"] * hp, shifted_target_db, masks["left"]),
-        "right": choose_channel_gain(freq, avg["right"] * hp, shifted_target_db, masks["right"]),
-        "sub": crossover["sub_gain_db"]
-        + choose_channel_gain(freq, avg["sub"] * lp * sub_hp, shifted_target_db, masks["sub"], headroom_db=-3.0),
-    }
-
-    results: List[ChannelResult] = []
-    corrected: Dict[str, np.ndarray] = {}
-    final_channels: Dict[str, np.ndarray] = {}
-    for key, title in [("left", "Left"), ("right", "Right"), ("sub", "Sub")]:
-        base = avg[key] * xover[key] * 10.0 ** (gains[key] / 20.0)
-        peq = find_peak_filters(freq, base, shifted_target_db, masks[key], MAX_PEQ_FILTERS)
-        peq_resp = cascade_response(peq, freq)
-        after_peq = base * peq_resp
-        residual = shifted_target_db - db(after_peq)
-        fir = make_fir(freq, residual, FIR_TAPS[key], masks[key])
-        f_resp = fir_response(fir, freq)
-        after_all = after_peq * f_resp
-        corrected[key] = after_all
-        final_channels[key] = apply_output_delay(after_all, freq, delays[key])
-        max_boost, max_cut = summarize_filters(peq)
-        before_err = db(base[masks[key]]) - shifted_target_db[masks[key]]
-        after_err = db(after_all[masks[key]]) - shifted_target_db[masks[key]]
-        results.append(
-            ChannelResult(
-                key=key,
-                title=title,
-                peq=peq,
-                fir=fir,
-                gain_db=gains[key],
-                delay_ms=delays[key],
-                fir_taps=FIR_TAPS[key],
-                rms_before_db=rms(before_err),
-                rms_after_db=rms(after_err),
-                max_boost_db=max_boost,
-                max_cut_db=max_cut,
-            )
+    def candidate_key(candidate: Dict[str, float]) -> Tuple[float, float, float]:
+        return (
+            round(float(candidate["crossover_hz"]), 6),
+            round(float(candidate["sub_delay_ms"]), 6),
+            round(float(candidate["sub_gain_db"]), 6),
         )
+
+    def exact_scorer(candidate: Dict[str, float]) -> Dict[str, float]:
+        key = candidate_key(candidate)
+        if key not in system_cache:
+            system_cache[key] = build_final_filter_system(
+                freq=freq,
+                avg=avg,
+                target_db=shifted_target_db,
+                crossover=candidate,
+                sub_low_freq=args.sub_low_freq,
+                sub_highpass_hz=args.sub_highpass_hz,
+                distortion=distortion,
+                fir_method=args.fir_method,
+                fir_ls_grid_points=args.fir_ls_grid_points,
+                fir_ls_lambda=args.fir_ls_lambda,
+                fir_ls_max_boost_db=args.fir_ls_max_boost_db,
+                fir_ls_max_cut_db=args.fir_ls_max_cut_db,
+            )
+        return score_final_system_candidate(
+            freq=freq,
+            final_channels=system_cache[key]["final_channels"],  # type: ignore[arg-type]
+            lsum_measured=avg["left_sum"],
+            rsum_measured=avg["right_sum"],
+            target_db=shifted_target_db,
+            crossover_hz=float(candidate["crossover_hz"]),
+            crossover_preference_hz=args.prefer_crossover,
+        )
+
+    crossover = select_exact_crossover_candidate(
+        proxy_crossover["top_candidates"],
+        exact_scorer=exact_scorer,
+        max_candidates=5,
+    )
+    selected_system = system_cache[candidate_key(crossover)]
+    fc = float(crossover["crossover_hz"])
+    delays = selected_system["delays"]  # type: ignore[assignment]
+    gains = selected_system["gains"]  # type: ignore[assignment]
+    results = selected_system["results"]  # type: ignore[assignment]
+    corrected = selected_system["corrected"]  # type: ignore[assignment]
+    final_channels = selected_system["final_channels"]  # type: ignore[assignment]
+    crossover_filters = selected_system["crossover_filters"]  # type: ignore[assignment]
 
     # Predicted combined response after the actual miniDSP output delays.
     pred_lsum = final_channels["left"] + final_channels["sub"]
@@ -1282,11 +1874,6 @@ def main() -> int:
             distortion_note += "."
 
     # Write files.
-    crossover_filters = {
-        "left": lr4_filters(fc, "hp"),
-        "right": lr4_filters(fc, "hp"),
-        "sub": lr4_filters(fc, "lp") + sub_hp_filters,
-    }
     for result in results:
         write_peq_file(out / f"peq_{result.key}_readable.txt", result.title, result.peq)
         write_minidsp_biquad_file(out / f"peq_{result.key}.txt", result.peq)
@@ -1319,7 +1906,16 @@ def main() -> int:
     )
     write_rows_csv(out / "midbass_alignment.csv", midbass_rows)
     write_rows_csv(out / "crossover_candidates.csv", crossover["top_candidates"])
-    write_settings_summary(out, crossover, delays, gains, results, args.sub_highpass_hz, args.sub_low_freq)
+    write_settings_summary(
+        out,
+        crossover,
+        delays,
+        gains,
+        results,
+        args.sub_highpass_hz,
+        args.sub_low_freq,
+        args.fir_method,
+    )
     build_report(
         out=out,
         notes=validation_notes,
@@ -1338,6 +1934,8 @@ def main() -> int:
         mic_compare_note=mic_compare_note,
         boundary_warning=boundary_warning,
         midbass_rows=midbass_rows,
+        fir_method=args.fir_method,
+        fir_ls_settings=fir_ls_settings,
     )
 
     metadata = {
@@ -1361,8 +1959,11 @@ def main() -> int:
         },
         "gains_db": gains,
         "fir_taps": FIR_TAPS,
+        "fir_method": args.fir_method,
+        "fir_ls_settings": fir_ls_settings if args.fir_method == "ls" else None,
         "validations": validations,
         "midbass_alignment": midbass_rows,
+        "peq_optimizer": {result.key: result.peq_optimization for result in results},
         "filters": {
             result.key: [
                 {

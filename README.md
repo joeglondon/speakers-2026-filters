@@ -39,7 +39,20 @@ Each profile folder includes:
 - `create_harman_filters.py` - an experimental from-scratch filter generator kept for comparison.
 - `test_generate_minidsp_filters.py` and `test_create_harman_filters.py` - unit tests for parsing, mic-cal handling, delay translation, FIR export sizing, and target extrapolation behavior.
 
-The primary script is intentionally NumPy-only so it can run in the bundled Codex Python runtime.
+Install the Python dependencies before generating filters:
+
+```bash
+/Users/josephlondon/.cache/codex-runtimes/codex-primary-runtime/dependencies/python/bin/python3 -m pip install -r requirements.txt
+```
+
+The primary script uses NumPy for DSP/FIR math and SciPy for bounded nonlinear PEQ refinement.
+
+`generate_minidsp_filters.py` now supports two FIR solvers:
+
+- `--fir-method ls` - weighted, regularized least-squares FIR generation. This is the default and is intended for experimentation.
+- `--fir-method legacy` - the older smoothed magnitude inverse using frequency sampling, inverse FFT, truncation, and windowing.
+
+`Output_ls_auto_50_140/` is the first auto-crossover LS output. It is included as a solver experiment, not as the current recommended listening profile: its generated report shows worse magnitude RMS than the legacy/reference 140 Hz output, even though crossover cancellation is improved.
 
 Example:
 
