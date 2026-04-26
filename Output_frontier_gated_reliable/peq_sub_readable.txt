@@ -1,0 +1,12 @@
+# Sub PEQ filters
+# miniDSP-style peaking filters plus normalized biquad coefficients
+# Biquad convention: y[n] = b0*x[n] + b1*x[n-1] + b2*x[n-2] - a1*y[n-1] - a2*y[n-2]
+
+Filter 1: ON PK Fc 57.861 Hz Gain -7.150 dB Q 3.6859
+  biquad b0=0.999565407809 b1=-1.99843625651 b2=0.998885179044 a1=-1.99843625651 a2=0.998450586853
+Filter 2: ON PK Fc 106.934 Hz Gain +2.327 dB Q 3.7100
+  biquad b0=1.00025328296 b1=-1.99830248964 b2=0.998098149137 a1=-1.99830248964 a2=0.998351432094
+Filter 3: ON PK Fc 80.933 Hz Gain -3.284 dB Q 6.1070
+  biquad b0=0.999835161712 b1=-1.99892467263 b2=0.999117554652 a1=-1.99892467263 a2=0.998952716364
+Filter 4: ON PK Fc 142.822 Hz Gain -2.141 dB Q 6.0083
+  biquad b0=0.999807899112 b1=-1.99815436763 b2=0.998433770511 a1=-1.99815436763 a2=0.998241669623
