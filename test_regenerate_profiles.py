@@ -102,6 +102,28 @@ class RegenerateProfilesTests(unittest.TestCase):
             self.assertIn("left_plus_sub", profile["sum_rms_50_160_db"])
             self.assertIn("db", profile["worst_cancellation"])
 
+    def test_default_specs_store_repo_relative_replay_commands(self):
+        root = Path.cwd()
+        specs = default_specs(
+            root,
+            python="/custom/python",
+            regenerate_output_root=Path("Baseline_Runs"),
+            regenerate=True,
+        )
+
+        first = specs[0]
+
+        self.assertEqual(first.command[0], "python")
+        self.assertEqual(first.command[1], "generate_minidsp_filters.py")
+        self.assertIn("--root", first.command)
+        self.assertEqual(first.command[first.command.index("--root") + 1], ".")
+        self.assertEqual(
+            first.command[first.command.index("--output") + 1],
+            "Baseline_Runs/ls_auto_50_140",
+        )
+        self.assertIsNotNone(first.run_command)
+        self.assertEqual(first.run_command[0], "/custom/python")
+
 
 if __name__ == "__main__":
     unittest.main()

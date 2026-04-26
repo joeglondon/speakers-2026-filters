@@ -32,6 +32,17 @@ class ProfileSpec:
     name: str
     artifact_dir: Path
     command: list[str]
+    run_command: list[str] | None = None
+
+
+def repo_relative_arg(root: Path, path: Path) -> str:
+    resolved_root = root.resolve()
+    resolved_path = (path if path.is_absolute() else root / path).resolve()
+    try:
+        relative = resolved_path.relative_to(resolved_root)
+    except ValueError:
+        return str(path)
+    return "." if relative == Path(".") else relative.as_posix()
 
 
 def command_for(
@@ -47,14 +58,15 @@ def command_for(
     fir_ls_fallback: str = "on",
     gain_refinement: str = "on",
     prefer_crossover: int | None = None,
+    repo_relative: bool = False,
 ) -> list[str]:
     command = [
-        python,
-        str(root / "generate_minidsp_filters.py"),
+        "python" if repo_relative else python,
+        "generate_minidsp_filters.py" if repo_relative else str(root / "generate_minidsp_filters.py"),
         "--root",
-        str(root),
+        "." if repo_relative else str(root),
         "--output",
-        str(output),
+        repo_relative_arg(root, output) if repo_relative else str(output),
         "--target-file",
         "Harman Target extrapolated to 15Hz.txt",
         "--min-crossover",
@@ -126,7 +138,8 @@ def default_specs(root: Path, *, python: str, regenerate_output_root: Path, rege
             ProfileSpec(
                 name=name,
                 artifact_dir=artifact_dir,
-                command=command_for(python, root, output, **kwargs),
+                command=command_for(python, root, output, repo_relative=True, **kwargs),
+                run_command=command_for(python, root, output, **kwargs),
             )
         )
     return specs
@@ -272,9 +285,9 @@ def write_summary(root: Path, specs: Iterable[ProfileSpec], summary_path: Path) 
     return summary
 
 
-def run_generation_commands(specs: Iterable[ProfileSpec]) -> None:
+def run_generation_commands(specs: Iterable[ProfileSpec], root: Path) -> None:
     for spec in specs:
-        subprocess.run(spec.command, check=True)
+        subprocess.run(spec.run_command or spec.command, check=True, cwd=root)
 
 
 def main() -> int:
@@ -304,7 +317,7 @@ def main() -> int:
         regenerate=args.regenerate,
     )
     if args.regenerate:
-        run_generation_commands(specs)
+        run_generation_commands(specs, root)
     write_summary(root, specs, summary_path)
     print(f"Wrote baseline comparison summary to {summary_path}")
     return 0

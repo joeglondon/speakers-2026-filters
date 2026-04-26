@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import Dict, Iterable, List, Sequence, Tuple
 
 import numpy as np
+from scipy.signal import freqz
 
 
 OUT_FS = 96_000.0
@@ -368,7 +369,12 @@ def average_impulse(measurements: Sequence[ImpulseMeasurement]) -> np.ndarray:
     aligned = []
     for m in measurements:
         shift = target_peak - m.peak_index
-        aligned.append(np.roll(m.samples, shift))
+        shifted = np.zeros_like(m.samples)
+        if shift >= 0:
+            shifted[shift:] = m.samples[: m.samples.size - shift]
+        else:
+            shifted[:shift] = m.samples[-shift:]
+        aligned.append(shifted)
     return np.mean(np.vstack(aligned), axis=0)
 
 
@@ -1292,8 +1298,8 @@ def ls_fir_correction_target(
     return design_freq, correction_target, weights
 
 def fir_response(fir: np.ndarray, freq: np.ndarray, fs: float = OUT_FS) -> np.ndarray:
-    n = np.arange(fir.size)
-    return np.exp(-1j * 2.0 * np.pi * np.outer(freq / fs, n)) @ fir
+    _, response = freqz(fir, worN=2.0 * np.pi * freq / fs)
+    return response
 
 
 def channel_rms_error(
@@ -1333,6 +1339,26 @@ def choose_fir_with_fallback(
         "legacy_rms_db": legacy_rms,
         "legacy_boost_over_cap_db": legacy_boost_over_cap,
     }
+    if (
+        (requested_method == "legacy" or ls_fir is None)
+        and boost_cap_db is not None
+        and legacy_boost_over_cap > 0.1
+    ):
+        if guardrail_fir is not None:
+            guardrail_response = after_peq * fir_response(guardrail_fir, freq)
+            guardrail_filter_boost = db(peq_filter_response * fir_response(guardrail_fir, freq))
+            guardrail_boost_over_cap = float(np.max(guardrail_filter_boost - boost_cap_db))
+            metrics["guardrail_rms_db"] = channel_rms_error(guardrail_response, target_db, correction_mask)
+            metrics["guardrail_boost_over_cap_db"] = guardrail_boost_over_cap
+            if guardrail_boost_over_cap <= 0.1:
+                return {
+                    "fir": guardrail_fir,
+                    "used_method": "flat guardrail fallback",
+                    "metrics": metrics,
+                }
+        raise ValueError(
+            "Legacy FIR violates the configured boost cap and no acceptable guardrail FIR is available."
+        )
     if requested_method == "legacy" or ls_fir is None:
         return {
             "fir": legacy_fir,

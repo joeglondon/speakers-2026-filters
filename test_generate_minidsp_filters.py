@@ -1,5 +1,6 @@
 import math
 import unittest
+from pathlib import Path
 
 import numpy as np
 
@@ -186,7 +187,7 @@ class GenerateMiniDSPFiltersTests(unittest.TestCase):
         ls_fir = np.asarray([2.0])
         legacy_fir = np.asarray([1.5])
         guardrail_fir = np.asarray([1.0])
-        cap = np.zeros_like(freq)
+        cap = np.full_like(freq, 2.0)
 
         selected = gen.choose_fir_with_fallback(
             freq,
@@ -203,6 +204,85 @@ class GenerateMiniDSPFiltersTests(unittest.TestCase):
 
         self.assertEqual(selected["used_method"], "flat guardrail fallback")
         self.assertIs(selected["fir"], guardrail_fir)
+
+    def test_legacy_fir_uses_flat_guardrail_when_it_violates_boost_cap(self):
+        freq = np.asarray([15.0, 20.0, 24.0])
+        target_db = np.zeros_like(freq)
+        after_peq = np.ones_like(freq, dtype=np.complex128)
+        mask = np.ones_like(freq, dtype=bool)
+        legacy_fir = np.asarray([1.5])
+        guardrail_fir = np.asarray([1.0])
+        cap = np.zeros_like(freq)
+
+        selected = gen.choose_fir_with_fallback(
+            freq,
+            after_peq,
+            target_db,
+            mask,
+            requested_method="legacy",
+            fallback_enabled=True,
+            ls_fir=None,
+            legacy_fir=legacy_fir,
+            guardrail_fir=guardrail_fir,
+            boost_cap_db=cap,
+        )
+
+        self.assertEqual(selected["used_method"], "flat guardrail fallback")
+        self.assertIs(selected["fir"], guardrail_fir)
+        self.assertGreater(selected["metrics"]["legacy_boost_over_cap_db"], 0.1)
+
+    def test_ls_fir_is_kept_when_legacy_violates_boost_cap_but_ls_is_safe(self):
+        freq = np.asarray([15.0, 20.0, 24.0])
+        target_db = np.zeros_like(freq)
+        after_peq = np.ones_like(freq, dtype=np.complex128) * 0.8
+        mask = np.ones_like(freq, dtype=bool)
+        ls_fir = np.asarray([1.25])
+        legacy_fir = np.asarray([1.5])
+        guardrail_fir = np.asarray([1.0])
+        cap = np.full_like(freq, 2.0)
+
+        selected = gen.choose_fir_with_fallback(
+            freq,
+            after_peq,
+            target_db,
+            mask,
+            requested_method="ls",
+            fallback_enabled=True,
+            ls_fir=ls_fir,
+            legacy_fir=legacy_fir,
+            guardrail_fir=guardrail_fir,
+            boost_cap_db=cap,
+        )
+
+        self.assertEqual(selected["used_method"], "ls")
+        self.assertIs(selected["fir"], ls_fir)
+        self.assertLessEqual(selected["metrics"]["ls_boost_over_cap_db"], 0.1)
+
+    def test_average_impulse_aligns_without_wrapping_samples(self):
+        first = gen.ImpulseMeasurement(
+            name="first",
+            path=Path("first.txt"),
+            peak_value=1.0,
+            peak_index=1,
+            length=5,
+            sample_interval=1.0,
+            start_time=0.0,
+            samples=np.asarray([0.0, 1.0, 0.0, 0.0, 9.0]),
+        )
+        second = gen.ImpulseMeasurement(
+            name="second",
+            path=Path("second.txt"),
+            peak_value=1.0,
+            peak_index=2,
+            length=5,
+            sample_interval=1.0,
+            start_time=0.0,
+            samples=np.asarray([0.0, 0.0, 1.0, 0.0, 0.0]),
+        )
+
+        averaged = gen.average_impulse([first, second])
+
+        np.testing.assert_allclose(averaged, np.asarray([0.0, 0.0, 1.0, 0.0, 0.0]))
 
     def test_gain_refinement_updates_score_with_same_final_gains(self):
         freq = np.asarray([80.0, 100.0, 120.0])
