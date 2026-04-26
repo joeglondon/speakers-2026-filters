@@ -1427,18 +1427,26 @@ def make_frontier_fir(
 
     objective = cp.Minimize(cp.sum(residual_terms) + 1e-4 * cp.sum_squares(second_difference_matrix(taps) @ h))
     problem = cp.Problem(objective, constraints)
-    problem.solve(solver="CLARABEL", verbose=False)
+    solver = "CLARABEL"
+    clarabel_error = ""
+    try:
+        problem.solve(solver="CLARABEL", verbose=False)
+    except cp.error.SolverError as exc:
+        clarabel_error = str(exc)
     if h.value is None or problem.status not in {cp.OPTIMAL, cp.OPTIMAL_INACCURATE}:
+        solver = "SCS"
         problem.solve(solver="SCS", verbose=False, max_iters=5000)
     if h.value is None:
         raise RuntimeError(f"CVXPY FIR solve failed with status {problem.status}")
     fir = np.asarray(h.value, dtype=np.float64)
     return fir, {
         "method": "cvxpy",
+        "solver": solver,
         "status": str(problem.status),
         "objective": float(problem.value),
         "positions": float(len(measured_positions)),
         "constraints": "boost_cap,energy,pre_ringing",
+        "clarabel_error": clarabel_error,
     }
 
 

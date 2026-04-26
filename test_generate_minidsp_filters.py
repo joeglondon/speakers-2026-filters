@@ -1,6 +1,7 @@
 import math
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import numpy as np
 
@@ -76,6 +77,38 @@ class GenerateMiniDSPFiltersTests(unittest.TestCase):
         self.assertEqual(fir.shape, (48,))
         self.assertEqual(metadata["method"], "cvxpy")
         self.assertLessEqual(float(np.max(response_db[mask])), 2.35)
+        self.assertTrue(np.all(np.isfinite(fir)))
+
+    def test_frontier_fir_falls_back_when_clarabel_raises_solver_error(self):
+        import cvxpy as cp
+
+        freq = np.geomspace(40.0, 400.0, 48)
+        measured_positions = [np.ones_like(freq, dtype=np.complex128)]
+        target_db = np.zeros_like(freq)
+        mask = np.ones_like(freq, dtype=bool)
+        original_solve = cp.Problem.solve
+        clarabel_calls = 0
+
+        def flaky_solve(problem, *args, **kwargs):
+            nonlocal clarabel_calls
+            if kwargs.get("solver") == "CLARABEL":
+                clarabel_calls += 1
+                raise cp.error.SolverError("forced CLARABEL failure")
+            return original_solve(problem, *args, **kwargs)
+
+        with mock.patch.object(cp.Problem, "solve", flaky_solve):
+            fir, metadata = gen.make_frontier_fir(
+                freq,
+                measured_positions,
+                target_db,
+                taps=24,
+                correction_mask=mask,
+                grid_points=48,
+            )
+
+        self.assertEqual(clarabel_calls, 1)
+        self.assertEqual(metadata["solver"], "SCS")
+        self.assertEqual(metadata["clarabel_error"], "forced CLARABEL failure")
         self.assertTrue(np.all(np.isfinite(fir)))
 
     def test_multipoint_score_uses_80th_percentile_not_only_average(self):
