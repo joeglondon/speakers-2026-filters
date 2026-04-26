@@ -32,6 +32,8 @@ FRONTIER_DENSE_BOOST_TOLERANCE_DB = 0.25
 FRONTIER_MAX_SAFETY_REFINEMENT_ITERATIONS = 4
 FRONTIER_EXTRA_CONSTRAINTS_PER_ITERATION = 8
 FRONTIER_IMMEDIATE_REJECTION_OVER_CAP_DB = 6.0
+FRONTIER_MAX_EFFECTIVE_TAPS = 64
+FRONTIER_MIN_DENSE_CONSTRAINT_POINTS = 384
 
 
 @dataclass
@@ -1447,6 +1449,22 @@ def frontier_guardrail_violation_frequencies(
     return np.asarray(selected, dtype=np.float64)
 
 
+def frontier_effective_taps(taps: int) -> int:
+    if taps <= 0:
+        raise ValueError("FIR tap count must be positive")
+    return min(taps, FRONTIER_MAX_EFFECTIVE_TAPS)
+
+
+def embed_centered_fir(short_fir: np.ndarray, taps: int) -> np.ndarray:
+    short = np.asarray(short_fir, dtype=np.float64)
+    if short.size > taps:
+        raise ValueError("Effective FIR cannot exceed exported tap count.")
+    full = np.zeros(taps, dtype=np.float64)
+    start = (taps - short.size) // 2
+    full[start : start + short.size] = short
+    return full
+
+
 def make_frontier_fir(
     freq: np.ndarray,
     measured_positions: Sequence[np.ndarray],
@@ -1460,17 +1478,25 @@ def make_frontier_fir(
     boost_cap_db: np.ndarray | None = None,
     max_filter_energy_db: float = 18.0,
     pre_ringing_limit_db: float = -18.0,
+    base_fir: np.ndarray | None = None,
 ) -> Tuple[np.ndarray, Dict[str, float | str | bool]]:
     if taps <= 0:
         raise ValueError("FIR tap count must be positive")
     if not measured_positions:
         raise ValueError("Frontier FIR requires at least one measured position.")
     cp = _require_cvxpy()
-    n = np.arange(taps, dtype=np.float64)
+    effective_taps = frontier_effective_taps(taps)
+    tap_offset = (taps - effective_taps) // 2
+    n = tap_offset + np.arange(effective_taps, dtype=np.float64)
     delay_samples = (taps - 1) / 2.0
-    regularizer = second_difference_matrix(taps)
+    regularizer = second_difference_matrix(effective_taps)
+    if base_fir is not None:
+        base_fir = np.asarray(base_fir, dtype=np.float64)
+        if base_fir.size != taps:
+            raise ValueError("Frontier base FIR must match exported tap count.")
+    basis = "legacy_plus_centered_delta" if base_fir is not None else "centered_short_fir"
 
-    def solve_on_grid(design_freq: np.ndarray) -> Tuple[np.ndarray, Dict[str, float | str]]:
+    def solve_on_grid(design_freq: np.ndarray, constraint_freq: np.ndarray) -> Tuple[np.ndarray, Dict[str, float | str]]:
         target = np.interp(design_freq, freq, target_db, left=target_db[0], right=target_db[-1])
         active = np.interp(design_freq, freq, correction_mask.astype(np.float64), left=0.0, right=0.0) >= 0.5
         boost_cap_design = (
@@ -1481,9 +1507,28 @@ def make_frontier_fir(
             if boost_cap_db is not None
             else np.full(design_freq.shape, float(max_boost_db), dtype=np.float64)
         )
+        boost_cap_constraint = (
+            np.minimum(
+                np.interp(constraint_freq, freq, np.asarray(boost_cap_db, dtype=np.float64)),
+                float(max_boost_db),
+            )
+            if boost_cap_db is not None
+            else np.full(constraint_freq.shape, float(max_boost_db), dtype=np.float64)
+        )
         fourier = np.exp(-1j * 2.0 * np.pi * np.outer(design_freq / fs, n))
+        constraint_fourier = np.exp(-1j * 2.0 * np.pi * np.outer(constraint_freq / fs, n))
+        base_design_response = (
+            fir_response(base_fir, design_freq, fs=fs)
+            if base_fir is not None
+            else np.zeros(design_freq.shape, dtype=np.complex128)
+        )
+        base_constraint_response = (
+            fir_response(base_fir, constraint_freq, fs=fs)
+            if base_fir is not None
+            else np.zeros(constraint_freq.shape, dtype=np.complex128)
+        )
         delay_phase = np.exp(-1j * 2.0 * np.pi * design_freq * (delay_samples / fs))
-        h = cp.Variable(taps)
+        h = cp.Variable(effective_taps)
 
         residual_terms = []
         for measured_response in measured_positions:
@@ -1497,19 +1542,24 @@ def make_frontier_fir(
             confidence = np.full(design_freq.shape, 0.08, dtype=np.float64)
             confidence[active] = 1.0
             confidence *= np.clip(np.abs(measured) / np.percentile(np.abs(measured), 75), 0.1, 1.0)
-            weighted_residual = cp.multiply(np.sqrt(confidence), cp.matmul(np.diag(measured), fourier) @ h - desired)
+            delta_response = fourier @ h
+            corrected_response = cp.multiply(measured, base_design_response + delta_response)
+            weighted_residual = cp.multiply(np.sqrt(confidence), corrected_response - desired)
             residual_terms.append(cp.sum_squares(cp.real(weighted_residual)) + cp.sum_squares(cp.imag(weighted_residual)))
 
         constraints = []
-        max_gain = 10.0 ** (boost_cap_design / 20.0)
-        correction_rows = np.flatnonzero(active)
-        if correction_rows.size:
-            constraints.append(cp.abs(fourier[correction_rows] @ h) <= max_gain[correction_rows])
+        max_gain = 10.0 ** (boost_cap_constraint / 20.0)
+        constraint_rows = np.arange(constraint_freq.size)
+        constraints.append(
+            cp.abs(base_constraint_response[constraint_rows] + constraint_fourier[constraint_rows] @ h)
+            <= max_gain[constraint_rows]
+        )
         constraints.append(cp.norm2(h) <= 10.0 ** (float(max_filter_energy_db) / 20.0))
         centre = taps // 2
         pre_limit = 10.0 ** (float(pre_ringing_limit_db) / 20.0)
-        if centre > 0:
-            constraints.append(cp.norm2(h[:centre]) <= pre_limit)
+        pre_count = int(np.count_nonzero((tap_offset + np.arange(effective_taps)) < centre))
+        if pre_count > 0:
+            constraints.append(cp.norm2(h[:pre_count]) <= pre_limit)
 
         objective = cp.Minimize(cp.sum(residual_terms) + 1e-4 * cp.sum_squares(regularizer @ h))
         problem = cp.Problem(objective, constraints)
@@ -1519,12 +1569,24 @@ def make_frontier_fir(
             problem.solve(solver="CLARABEL", verbose=False)
         except cp.error.SolverError as exc:
             clarabel_error = str(exc)
-        if h.value is None or problem.status not in {cp.OPTIMAL, cp.OPTIMAL_INACCURATE}:
-            solver = "SCS"
-            problem.solve(solver="SCS", verbose=False, max_iters=5000)
         if h.value is None:
-            raise RuntimeError(f"CVXPY FIR solve failed with status {problem.status}")
-        return np.asarray(h.value, dtype=np.float64), {
+            failed_fir = base_fir.copy() if base_fir is not None else flat_delay_fir(taps)
+            return failed_fir, {
+                "method": "cvxpy",
+                "solver": solver,
+                "status": "clarabel_failed",
+                "objective": float("inf"),
+                "positions": float(len(measured_positions)),
+                "constraints": "boost_cap,energy,pre_ringing,dense_guardrail",
+                "clarabel_error": clarabel_error,
+                "design_points_used": float(design_freq.size),
+                "dense_constraint_points_used": float(constraint_freq.size),
+                "effective_taps": float(effective_taps),
+                "basis": basis,
+            }
+        delta_fir = embed_centered_fir(np.asarray(h.value, dtype=np.float64), taps)
+        fir = (base_fir + delta_fir) if base_fir is not None else delta_fir
+        return fir, {
             "method": "cvxpy",
             "solver": solver,
             "status": str(problem.status),
@@ -1533,6 +1595,9 @@ def make_frontier_fir(
             "constraints": "boost_cap,energy,pre_ringing,dense_guardrail",
             "clarabel_error": clarabel_error,
             "design_points_used": float(design_freq.size),
+            "dense_constraint_points_used": float(constraint_freq.size),
+            "effective_taps": float(effective_taps),
+            "basis": basis,
         }
 
     extra_freq = np.asarray([], dtype=np.float64)
@@ -1542,9 +1607,15 @@ def make_frontier_fir(
             correction_mask,
             fs=fs,
             grid_points=grid_points,
+        )
+        constraint_freq = design_fir_frequency_grid(
+            freq,
+            correction_mask,
+            fs=fs,
+            grid_points=max(grid_points * 8, FRONTIER_MIN_DENSE_CONSTRAINT_POINTS),
             extra_freq=extra_freq,
         )
-        fir, metadata = solve_on_grid(design_freq)
+        fir, metadata = solve_on_grid(design_freq, constraint_freq)
         dense_metrics = dense_fir_guardrail_metrics(
             freq,
             fir,
@@ -1789,6 +1860,13 @@ def choose_frontier_fir_with_fallback(
         frontier_boost_over_cap,
     )
     status = str(frontier_metrics.get("status", "unknown"))
+    dense_guardrail_pass = bool(frontier_metrics.get("dense_guardrail_pass", dense_over_cap <= FRONTIER_DENSE_BOOST_TOLERANCE_DB))
+    certified_inaccurate = (
+        status == "optimal_inaccurate"
+        and str(frontier_metrics.get("basis", "")) == "legacy_plus_centered_delta"
+        and dense_guardrail_pass
+        and dense_over_cap <= FRONTIER_DENSE_BOOST_TOLERANCE_DB
+    )
     metrics: Dict[str, object] = {
         **frontier_metrics,
         "after_peq_rms_db": after_peq_rms,
@@ -1801,7 +1879,7 @@ def choose_frontier_fir_with_fallback(
     }
 
     rejection_reason = ""
-    if status != "optimal":
+    if status != "optimal" and not certified_inaccurate:
         rejection_reason = f"solver_status: {status}"
     elif dense_over_cap > FRONTIER_DENSE_BOOST_TOLERANCE_DB:
         rejection_reason = "dense_guardrail_violation"
@@ -1813,6 +1891,8 @@ def choose_frontier_fir_with_fallback(
 
     if not rejection_reason:
         metrics["frontier_accepted"] = True
+        if certified_inaccurate:
+            metrics["frontier_status_certified_by_dense_guardrail"] = True
         return {
             "fir": frontier_fir,
             "used_method": "frontier cvxpy",
@@ -2328,6 +2408,7 @@ def build_final_filter_system(
                     boost_cap_db=fir_boost_cap,
                     max_filter_energy_db=frontier_max_filter_energy_db,
                     pre_ringing_limit_db=frontier_pre_ringing_limit_db,
+                    base_fir=legacy_fir,
                 )
             elif fir_method == "ls":
                 ls_fir = make_fir_ls(
@@ -2728,6 +2809,8 @@ def build_report(
             )
             if reason:
                 detail += f"; rejection reason: {reason}"
+            if metrics.get("frontier_status_certified_by_dense_guardrail"):
+                detail += "; inaccurate status certified by dense guardrail"
             detail += "."
             lines.append(detail)
     lines.append(

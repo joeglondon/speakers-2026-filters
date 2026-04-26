@@ -79,7 +79,57 @@ class GenerateMiniDSPFiltersTests(unittest.TestCase):
         self.assertLessEqual(float(np.max(response_db[mask])), 2.35)
         self.assertTrue(np.all(np.isfinite(fir)))
 
-    def test_frontier_fir_falls_back_when_clarabel_raises_solver_error(self):
+    def test_frontier_fir_uses_reduced_effective_tap_basis_for_long_exports(self):
+        freq = np.geomspace(80.0, 18_000.0, 180)
+        measured_positions = [
+            np.ones_like(freq, dtype=np.complex128),
+            np.ones_like(freq, dtype=np.complex128) * (10.0 ** (-1.0 / 20.0)),
+        ]
+        target_db = np.zeros_like(freq)
+        mask = (freq >= 100.0) & (freq <= 12_000.0)
+
+        fir, metadata = gen.make_frontier_fir(
+            freq,
+            measured_positions,
+            target_db,
+            taps=512,
+            correction_mask=mask,
+            grid_points=64,
+            max_boost_db=3.0,
+            max_cut_db=10.0,
+        )
+        response_db = gen.db(gen.fir_response(fir, freq))
+
+        self.assertEqual(fir.shape, (512,))
+        self.assertLess(metadata["effective_taps"], 512)
+        self.assertEqual(metadata["basis"], "centered_short_fir")
+        self.assertLessEqual(float(np.max(response_db[mask])), 3.25)
+        self.assertTrue(metadata["dense_guardrail_pass"])
+
+    def test_frontier_fir_can_refine_from_legacy_base_fir(self):
+        freq = np.geomspace(80.0, 18_000.0, 96)
+        measured_positions = [np.ones_like(freq, dtype=np.complex128)]
+        target_db = np.zeros_like(freq)
+        mask = (freq >= 100.0) & (freq <= 12_000.0)
+        base_fir = gen.flat_delay_fir(65)
+
+        fir, metadata = gen.make_frontier_fir(
+            freq,
+            measured_positions,
+            target_db,
+            taps=65,
+            correction_mask=mask,
+            grid_points=48,
+            max_boost_db=3.0,
+            max_cut_db=10.0,
+            base_fir=base_fir,
+        )
+
+        self.assertEqual(metadata["basis"], "legacy_plus_centered_delta")
+        self.assertTrue(metadata["dense_guardrail_pass"])
+        self.assertLess(float(np.linalg.norm(fir - base_fir)), 1e-3)
+
+    def test_frontier_fir_reports_failure_when_clarabel_raises_solver_error(self):
         import cvxpy as cp
 
         freq = np.geomspace(40.0, 400.0, 48)
@@ -107,7 +157,8 @@ class GenerateMiniDSPFiltersTests(unittest.TestCase):
             )
 
         self.assertEqual(clarabel_calls, 1)
-        self.assertEqual(metadata["solver"], "SCS")
+        self.assertEqual(metadata["solver"], "CLARABEL")
+        self.assertEqual(metadata["status"], "clarabel_failed")
         self.assertEqual(metadata["clarabel_error"], "forced CLARABEL failure")
         self.assertTrue(np.all(np.isfinite(fir)))
 
@@ -181,6 +232,34 @@ class GenerateMiniDSPFiltersTests(unittest.TestCase):
         self.assertEqual(selected["used_method"], "legacy fallback")
         self.assertFalse(selected["metrics"]["frontier_accepted"])
         self.assertEqual(selected["metrics"]["frontier_rejection_reason"], "solver_status: optimal_inaccurate")
+
+    def test_frontier_fallback_accepts_dense_certified_legacy_delta_inaccurate_status(self):
+        freq = np.asarray([100.0, 200.0, 400.0])
+        target_db = np.full_like(freq, 6.020599913279624)
+        after_peq = np.ones_like(freq, dtype=np.complex128)
+        mask = np.ones_like(freq, dtype=bool)
+        frontier_fir = np.asarray([2.0])
+        legacy_fir = np.asarray([2.0])
+
+        selected = gen.choose_frontier_fir_with_fallback(
+            freq,
+            after_peq,
+            target_db,
+            mask,
+            fallback_enabled=True,
+            frontier_fir=frontier_fir,
+            frontier_metrics={
+                "status": "optimal_inaccurate",
+                "basis": "legacy_plus_centered_delta",
+                "dense_guardrail_pass": True,
+                "dense_boost_over_cap_db": 0.0,
+            },
+            legacy_fir=legacy_fir,
+        )
+
+        self.assertEqual(selected["used_method"], "frontier cvxpy")
+        self.assertTrue(selected["metrics"]["frontier_accepted"])
+        self.assertTrue(selected["metrics"]["frontier_status_certified_by_dense_guardrail"])
 
     def test_frontier_fallback_raises_when_fallback_disabled(self):
         freq = np.asarray([100.0, 200.0, 400.0])
