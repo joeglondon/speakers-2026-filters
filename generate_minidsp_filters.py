@@ -15,7 +15,7 @@ import math
 import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Iterable, List, Sequence, Tuple
+from typing import Callable, Dict, Iterable, List, Sequence, Tuple
 
 import numpy as np
 from scipy.signal import freqz
@@ -28,6 +28,10 @@ FIR_TAPS = {"left": 1022, "right": 1022, "sub": 2040}
 TOTAL_TAPS_AVAILABLE = 4096
 OUTPUT4_RESERVED_TAPS = 6
 EPS = 1e-12
+FRONTIER_DENSE_BOOST_TOLERANCE_DB = 0.25
+FRONTIER_MAX_SAFETY_REFINEMENT_ITERATIONS = 4
+FRONTIER_EXTRA_CONSTRAINTS_PER_ITERATION = 8
+FRONTIER_IMMEDIATE_REJECTION_OVER_CAP_DB = 6.0
 
 
 @dataclass
@@ -1262,6 +1266,7 @@ def design_fir_frequency_grid(
     correction_mask: np.ndarray,
     fs: float = OUT_FS,
     grid_points: int = 1024,
+    extra_freq: np.ndarray | None = None,
 ) -> np.ndarray:
     if grid_points < 32:
         raise ValueError("--fir-ls-grid-points must be at least 32")
@@ -1274,6 +1279,10 @@ def design_fir_frequency_grid(
         high = max(high, min(float(active_freq[-1]) * 1.35, fs * 0.5 * 0.98))
     grid = np.geomspace(low, high, grid_points)
     anchors = np.asarray([0.0, low, high, fs * 0.5], dtype=np.float64)
+    if extra_freq is not None and np.asarray(extra_freq).size:
+        extra = np.asarray(extra_freq, dtype=np.float64)
+        extra = extra[(extra >= 0.0) & (extra <= fs * 0.5)]
+        return np.unique(np.r_[anchors, grid, extra])
     return np.unique(np.r_[anchors, grid])
 
 
@@ -1363,6 +1372,81 @@ def _require_cvxpy():
     return cp
 
 
+def fir_boost_cap_array(
+    freq: np.ndarray,
+    boost_cap_db: np.ndarray | None,
+    max_boost_db: float,
+) -> np.ndarray:
+    if boost_cap_db is None:
+        return np.full(freq.shape, float(max_boost_db), dtype=np.float64)
+    return np.minimum(np.asarray(boost_cap_db, dtype=np.float64), float(max_boost_db))
+
+
+def dense_fir_guardrail_metrics(
+    freq: np.ndarray,
+    fir: np.ndarray,
+    correction_mask: np.ndarray,
+    boost_cap_db: np.ndarray | None = None,
+    max_boost_db: float = 3.0,
+    tolerance_db: float = FRONTIER_DENSE_BOOST_TOLERANCE_DB,
+    filter_response: np.ndarray | None = None,
+) -> Dict[str, float | bool]:
+    active = np.asarray(correction_mask, dtype=bool)
+    if not np.any(active):
+        return {
+            "dense_max_boost_db": 0.0,
+            "dense_max_boost_hz": 0.0,
+            "dense_boost_over_cap_db": 0.0,
+            "dense_guardrail_pass": True,
+        }
+
+    response = filter_response if filter_response is not None else fir_response(fir, freq)
+    response_db = db(response)
+    cap = fir_boost_cap_array(freq, boost_cap_db, max_boost_db)
+    active_indices = np.flatnonzero(active)
+    active_boost = response_db[active_indices]
+    active_over_cap = active_boost - cap[active_indices]
+    max_idx = int(active_indices[int(np.argmax(active_boost))])
+    over_idx = int(active_indices[int(np.argmax(active_over_cap))])
+    max_over = float(active_over_cap[int(np.argmax(active_over_cap))])
+    return {
+        "dense_max_boost_db": float(response_db[max_idx]),
+        "dense_max_boost_hz": float(freq[max_idx]),
+        "dense_boost_over_cap_db": max_over,
+        "dense_boost_over_cap_hz": float(freq[over_idx]),
+        "dense_guardrail_pass": bool(max_over <= tolerance_db),
+    }
+
+
+def frontier_guardrail_violation_frequencies(
+    freq: np.ndarray,
+    fir: np.ndarray,
+    correction_mask: np.ndarray,
+    boost_cap_db: np.ndarray | None,
+    max_boost_db: float,
+    count: int = FRONTIER_EXTRA_CONSTRAINTS_PER_ITERATION,
+) -> np.ndarray:
+    active = np.asarray(correction_mask, dtype=bool)
+    if not np.any(active):
+        return np.asarray([], dtype=np.float64)
+    response_db = db(fir_response(fir, freq))
+    cap = fir_boost_cap_array(freq, boost_cap_db, max_boost_db)
+    over_cap = response_db - cap
+    candidates = np.flatnonzero(active & (over_cap > FRONTIER_DENSE_BOOST_TOLERANCE_DB))
+    if candidates.size == 0:
+        return np.asarray([], dtype=np.float64)
+
+    ordered = candidates[np.argsort(over_cap[candidates])[::-1]]
+    selected: List[float] = []
+    for idx in ordered:
+        candidate_hz = float(freq[idx])
+        if all(abs(math.log2(candidate_hz / existing)) >= 1.0 / 96.0 for existing in selected if existing > 0.0):
+            selected.append(candidate_hz)
+        if len(selected) >= count:
+            break
+    return np.asarray(selected, dtype=np.float64)
+
+
 def make_frontier_fir(
     freq: np.ndarray,
     measured_positions: Sequence[np.ndarray],
@@ -1376,78 +1460,134 @@ def make_frontier_fir(
     boost_cap_db: np.ndarray | None = None,
     max_filter_energy_db: float = 18.0,
     pre_ringing_limit_db: float = -18.0,
-) -> Tuple[np.ndarray, Dict[str, float | str]]:
+) -> Tuple[np.ndarray, Dict[str, float | str | bool]]:
     if taps <= 0:
         raise ValueError("FIR tap count must be positive")
     if not measured_positions:
         raise ValueError("Frontier FIR requires at least one measured position.")
     cp = _require_cvxpy()
-    design_freq = design_fir_frequency_grid(freq, correction_mask, fs=fs, grid_points=grid_points)
-    target = np.interp(design_freq, freq, target_db, left=target_db[0], right=target_db[-1])
-    active = np.interp(design_freq, freq, correction_mask.astype(np.float64), left=0.0, right=0.0) >= 0.5
-    boost_cap_design = (
-        np.minimum(
-            np.interp(design_freq, freq, np.asarray(boost_cap_db, dtype=np.float64)),
-            float(max_boost_db),
-        )
-        if boost_cap_db is not None
-        else np.full(design_freq.shape, float(max_boost_db), dtype=np.float64)
-    )
     n = np.arange(taps, dtype=np.float64)
-    fourier = np.exp(-1j * 2.0 * np.pi * np.outer(design_freq / fs, n))
     delay_samples = (taps - 1) / 2.0
-    delay_phase = np.exp(-1j * 2.0 * np.pi * design_freq * (delay_samples / fs))
-    h = cp.Variable(taps)
+    regularizer = second_difference_matrix(taps)
 
-    residual_terms = []
-    for measured_response in measured_positions:
-        measured = interp_complex(freq, np.asarray(measured_response, dtype=np.complex128), design_freq)
-        measured_db = db(measured)
-        correction_db = np.maximum(target - measured_db, -float(max_cut_db))
-        correction_db = np.minimum(correction_db, boost_cap_design)
-        correction_db[~active] = 0.0
-        desired_mag = np.abs(measured) * (10.0 ** (correction_db / 20.0))
-        desired = desired_mag * np.exp(1j * np.angle(measured)) * delay_phase
-        confidence = np.full(design_freq.shape, 0.08, dtype=np.float64)
-        confidence[active] = 1.0
-        confidence *= np.clip(np.abs(measured) / np.percentile(np.abs(measured), 75), 0.1, 1.0)
-        weighted_residual = cp.multiply(np.sqrt(confidence), cp.matmul(np.diag(measured), fourier) @ h - desired)
-        residual_terms.append(cp.sum_squares(cp.real(weighted_residual)) + cp.sum_squares(cp.imag(weighted_residual)))
+    def solve_on_grid(design_freq: np.ndarray) -> Tuple[np.ndarray, Dict[str, float | str]]:
+        target = np.interp(design_freq, freq, target_db, left=target_db[0], right=target_db[-1])
+        active = np.interp(design_freq, freq, correction_mask.astype(np.float64), left=0.0, right=0.0) >= 0.5
+        boost_cap_design = (
+            np.minimum(
+                np.interp(design_freq, freq, np.asarray(boost_cap_db, dtype=np.float64)),
+                float(max_boost_db),
+            )
+            if boost_cap_db is not None
+            else np.full(design_freq.shape, float(max_boost_db), dtype=np.float64)
+        )
+        fourier = np.exp(-1j * 2.0 * np.pi * np.outer(design_freq / fs, n))
+        delay_phase = np.exp(-1j * 2.0 * np.pi * design_freq * (delay_samples / fs))
+        h = cp.Variable(taps)
 
-    constraints = []
-    max_gain = 10.0 ** (boost_cap_design / 20.0)
-    correction_rows = np.flatnonzero(active)
-    if correction_rows.size:
-        constraints.append(cp.abs(fourier[correction_rows] @ h) <= max_gain[correction_rows])
-    constraints.append(cp.norm2(h) <= 10.0 ** (float(max_filter_energy_db) / 20.0))
-    centre = taps // 2
-    pre_limit = 10.0 ** (float(pre_ringing_limit_db) / 20.0)
-    if centre > 0:
-        constraints.append(cp.norm2(h[:centre]) <= pre_limit)
+        residual_terms = []
+        for measured_response in measured_positions:
+            measured = interp_complex(freq, np.asarray(measured_response, dtype=np.complex128), design_freq)
+            measured_db = db(measured)
+            correction_db = np.maximum(target - measured_db, -float(max_cut_db))
+            correction_db = np.minimum(correction_db, boost_cap_design)
+            correction_db[~active] = 0.0
+            desired_mag = np.abs(measured) * (10.0 ** (correction_db / 20.0))
+            desired = desired_mag * np.exp(1j * np.angle(measured)) * delay_phase
+            confidence = np.full(design_freq.shape, 0.08, dtype=np.float64)
+            confidence[active] = 1.0
+            confidence *= np.clip(np.abs(measured) / np.percentile(np.abs(measured), 75), 0.1, 1.0)
+            weighted_residual = cp.multiply(np.sqrt(confidence), cp.matmul(np.diag(measured), fourier) @ h - desired)
+            residual_terms.append(cp.sum_squares(cp.real(weighted_residual)) + cp.sum_squares(cp.imag(weighted_residual)))
 
-    objective = cp.Minimize(cp.sum(residual_terms) + 1e-4 * cp.sum_squares(second_difference_matrix(taps) @ h))
-    problem = cp.Problem(objective, constraints)
-    solver = "CLARABEL"
-    clarabel_error = ""
-    try:
-        problem.solve(solver="CLARABEL", verbose=False)
-    except cp.error.SolverError as exc:
-        clarabel_error = str(exc)
-    if h.value is None or problem.status not in {cp.OPTIMAL, cp.OPTIMAL_INACCURATE}:
-        solver = "SCS"
-        problem.solve(solver="SCS", verbose=False, max_iters=5000)
-    if h.value is None:
-        raise RuntimeError(f"CVXPY FIR solve failed with status {problem.status}")
-    fir = np.asarray(h.value, dtype=np.float64)
-    return fir, {
-        "method": "cvxpy",
-        "solver": solver,
-        "status": str(problem.status),
-        "objective": float(problem.value),
-        "positions": float(len(measured_positions)),
-        "constraints": "boost_cap,energy,pre_ringing",
-        "clarabel_error": clarabel_error,
-    }
+        constraints = []
+        max_gain = 10.0 ** (boost_cap_design / 20.0)
+        correction_rows = np.flatnonzero(active)
+        if correction_rows.size:
+            constraints.append(cp.abs(fourier[correction_rows] @ h) <= max_gain[correction_rows])
+        constraints.append(cp.norm2(h) <= 10.0 ** (float(max_filter_energy_db) / 20.0))
+        centre = taps // 2
+        pre_limit = 10.0 ** (float(pre_ringing_limit_db) / 20.0)
+        if centre > 0:
+            constraints.append(cp.norm2(h[:centre]) <= pre_limit)
+
+        objective = cp.Minimize(cp.sum(residual_terms) + 1e-4 * cp.sum_squares(regularizer @ h))
+        problem = cp.Problem(objective, constraints)
+        solver = "CLARABEL"
+        clarabel_error = ""
+        try:
+            problem.solve(solver="CLARABEL", verbose=False)
+        except cp.error.SolverError as exc:
+            clarabel_error = str(exc)
+        if h.value is None or problem.status not in {cp.OPTIMAL, cp.OPTIMAL_INACCURATE}:
+            solver = "SCS"
+            problem.solve(solver="SCS", verbose=False, max_iters=5000)
+        if h.value is None:
+            raise RuntimeError(f"CVXPY FIR solve failed with status {problem.status}")
+        return np.asarray(h.value, dtype=np.float64), {
+            "method": "cvxpy",
+            "solver": solver,
+            "status": str(problem.status),
+            "objective": float(problem.value),
+            "positions": float(len(measured_positions)),
+            "constraints": "boost_cap,energy,pre_ringing,dense_guardrail",
+            "clarabel_error": clarabel_error,
+            "design_points_used": float(design_freq.size),
+        }
+
+    extra_freq = np.asarray([], dtype=np.float64)
+    for iteration in range(FRONTIER_MAX_SAFETY_REFINEMENT_ITERATIONS + 1):
+        design_freq = design_fir_frequency_grid(
+            freq,
+            correction_mask,
+            fs=fs,
+            grid_points=grid_points,
+            extra_freq=extra_freq,
+        )
+        fir, metadata = solve_on_grid(design_freq)
+        dense_metrics = dense_fir_guardrail_metrics(
+            freq,
+            fir,
+            correction_mask,
+            boost_cap_db=boost_cap_db,
+            max_boost_db=max_boost_db,
+        )
+        if (
+            iteration == 0
+            and float(dense_metrics["dense_boost_over_cap_db"]) > FRONTIER_IMMEDIATE_REJECTION_OVER_CAP_DB
+        ):
+            return fir, {
+                **metadata,
+                **dense_metrics,
+                "safety_refinement_iterations": 0.0,
+                "safety_refinement_added_freqs": 0.0,
+                "safety_refinement_skipped_reason": "large_dense_guardrail_violation",
+            }
+        if dense_metrics["dense_guardrail_pass"] or iteration == FRONTIER_MAX_SAFETY_REFINEMENT_ITERATIONS:
+            return fir, {
+                **metadata,
+                **dense_metrics,
+                "safety_refinement_iterations": float(iteration),
+                "safety_refinement_added_freqs": float(extra_freq.size),
+            }
+
+        violating_freq = frontier_guardrail_violation_frequencies(
+            freq,
+            fir,
+            correction_mask,
+            boost_cap_db,
+            max_boost_db,
+        )
+        if violating_freq.size == 0:
+            return fir, {
+                **metadata,
+                **dense_metrics,
+                "safety_refinement_iterations": float(iteration),
+                "safety_refinement_added_freqs": float(extra_freq.size),
+            }
+        extra_freq = np.unique(np.r_[extra_freq, violating_freq])
+
+    raise RuntimeError("unreachable frontier FIR safety refinement state")
 
 
 def ls_fir_correction_target(
@@ -1607,6 +1747,98 @@ def choose_fir_with_fallback(
     return {
         "fir": ls_fir,
         "used_method": "ls",
+        "metrics": metrics,
+    }
+
+
+def choose_frontier_fir_with_fallback(
+    freq: np.ndarray,
+    after_peq: np.ndarray,
+    target_db: np.ndarray,
+    correction_mask: np.ndarray,
+    fallback_enabled: bool,
+    frontier_fir: np.ndarray,
+    frontier_metrics: Dict[str, object],
+    legacy_fir: np.ndarray,
+    guardrail_fir: np.ndarray | None = None,
+    fallback_tolerance_db: float = 0.25,
+    boost_cap_db: np.ndarray | None = None,
+    peq_response: np.ndarray | None = None,
+) -> Dict[str, object]:
+    after_peq_rms = channel_rms_error(after_peq, target_db, correction_mask)
+    legacy_response = after_peq * fir_response(legacy_fir, freq)
+    legacy_rms = channel_rms_error(legacy_response, target_db, correction_mask)
+    frontier_response = after_peq * fir_response(frontier_fir, freq)
+    frontier_rms = channel_rms_error(frontier_response, target_db, correction_mask)
+    peq_filter_response = peq_response if peq_response is not None else np.ones_like(freq, dtype=np.complex128)
+
+    legacy_filter_boost = db(peq_filter_response * fir_response(legacy_fir, freq))
+    legacy_boost_over_cap = (
+        float(np.max(legacy_filter_boost - boost_cap_db))
+        if boost_cap_db is not None
+        else 0.0
+    )
+    frontier_filter_boost = db(peq_filter_response * fir_response(frontier_fir, freq))
+    frontier_boost_over_cap = (
+        float(np.max(frontier_filter_boost - boost_cap_db))
+        if boost_cap_db is not None
+        else float(frontier_metrics.get("dense_boost_over_cap_db", 0.0))
+    )
+    dense_over_cap = max(
+        float(frontier_metrics.get("dense_boost_over_cap_db", 0.0)),
+        frontier_boost_over_cap,
+    )
+    status = str(frontier_metrics.get("status", "unknown"))
+    metrics: Dict[str, object] = {
+        **frontier_metrics,
+        "after_peq_rms_db": after_peq_rms,
+        "legacy_rms_db": legacy_rms,
+        "legacy_boost_over_cap_db": legacy_boost_over_cap,
+        "frontier_rms_db": frontier_rms,
+        "frontier_boost_over_cap_db": frontier_boost_over_cap,
+        "frontier_accepted": False,
+        "frontier_rejection_reason": "",
+    }
+
+    rejection_reason = ""
+    if status != "optimal":
+        rejection_reason = f"solver_status: {status}"
+    elif dense_over_cap > FRONTIER_DENSE_BOOST_TOLERANCE_DB:
+        rejection_reason = "dense_guardrail_violation"
+    elif not (
+        frontier_rms < after_peq_rms
+        and frontier_rms <= legacy_rms + fallback_tolerance_db
+    ):
+        rejection_reason = "frontier_worse_than_reliable"
+
+    if not rejection_reason:
+        metrics["frontier_accepted"] = True
+        return {
+            "fir": frontier_fir,
+            "used_method": "frontier cvxpy",
+            "metrics": metrics,
+        }
+
+    metrics["frontier_rejection_reason"] = rejection_reason
+    if not fallback_enabled:
+        raise ValueError(f"Frontier FIR rejected ({rejection_reason}) and fallback is disabled.")
+
+    if boost_cap_db is not None and legacy_boost_over_cap > 0.1 and guardrail_fir is not None:
+        guardrail_response = after_peq * fir_response(guardrail_fir, freq)
+        guardrail_filter_boost = db(peq_filter_response * fir_response(guardrail_fir, freq))
+        guardrail_boost_over_cap = float(np.max(guardrail_filter_boost - boost_cap_db))
+        metrics["guardrail_rms_db"] = channel_rms_error(guardrail_response, target_db, correction_mask)
+        metrics["guardrail_boost_over_cap_db"] = guardrail_boost_over_cap
+        if guardrail_boost_over_cap <= 0.1:
+            return {
+                "fir": guardrail_fir,
+                "used_method": "flat guardrail fallback",
+                "metrics": metrics,
+            }
+
+    return {
+        "fir": legacy_fir,
+        "used_method": "legacy fallback",
         "metrics": metrics,
     }
 
@@ -1873,6 +2105,34 @@ def gain_refinement_metadata(refinement: Dict[str, object]) -> Dict[str, object]
     }
 
 
+def candidate_cache_key(candidate: Dict[str, float]) -> Tuple[float, float, float]:
+    return (
+        round(float(candidate["crossover_hz"]), 6),
+        round(float(candidate["sub_delay_ms"]), 6),
+        round(float(candidate["sub_gain_db"]), 6),
+    )
+
+
+def score_exact_candidate_system(
+    candidate: Dict[str, float],
+    *,
+    cache: Dict[Tuple[float, float, float], Dict[str, object]],
+    build_kwargs: Dict[str, object],
+    score_kwargs: Dict[str, object],
+    builder: Callable[..., Dict[str, object]] | None = None,
+) -> Dict[str, float]:
+    key = candidate_cache_key(candidate)
+    if builder is None:
+        builder = build_final_filter_system
+    if key not in cache:
+        cache[key] = builder(crossover=candidate, **build_kwargs)
+    return score_final_system_candidate(
+        final_channels=cache[key]["final_channels"],  # type: ignore[arg-type]
+        crossover_hz=float(candidate["crossover_hz"]),
+        **score_kwargs,
+    )
+
+
 def select_exact_crossover_candidate(
     candidates: Sequence[Dict[str, float]],
     exact_scorer,
@@ -1988,6 +2248,7 @@ def build_final_filter_system(
         results: List[ChannelResult] = []
         corrected: Dict[str, np.ndarray] = {}
         final_channels: Dict[str, np.ndarray] = {}
+        frontier_disabled_reason = ""
         for key, title in [("left", "Left"), ("right", "Right"), ("sub", "Sub")]:
             base = avg[key] * xover[key] * 10.0 ** (current_gains[key] / 20.0)
             peq_boost_cap = boost_cap_curve_db(freq, distortion, key, default_boost_db=3.0)
@@ -2028,7 +2289,28 @@ def build_final_filter_system(
             )
             ls_fir = None
             frontier_metrics: Dict[str, object] | None = None
-            if optimizer_mode == "frontier":
+            selected_fir: Dict[str, object] | None = None
+            if optimizer_mode == "frontier" and frontier_disabled_reason:
+                selected_fir = choose_frontier_fir_with_fallback(
+                    freq,
+                    after_peq,
+                    target_db,
+                    masks[key],
+                    fallback_enabled=True,
+                    frontier_fir=legacy_fir,
+                    frontier_metrics={
+                        "method": "cvxpy",
+                        "solver": "not_run",
+                        "status": frontier_disabled_reason,
+                        "dense_boost_over_cap_db": 0.0,
+                        "frontier_rejection_reason": frontier_disabled_reason,
+                    },
+                    legacy_fir=legacy_fir,
+                    guardrail_fir=flat_delay_fir(FIR_TAPS[key]),
+                    boost_cap_db=fir_boost_cap if key == "sub" else None,
+                    peq_response=peq_resp,
+                )
+            elif optimizer_mode == "frontier":
                 assert multipoint is not None
                 position_after_peq = [
                     position * xover[key] * 10.0 ** (current_gains[key] / 20.0) * peq_resp
@@ -2064,14 +2346,29 @@ def build_final_filter_system(
             elif fir_method != "legacy":
                 raise ValueError(f"Unsupported FIR method: {fir_method}")
 
-            if optimizer_mode == "frontier":
+            if optimizer_mode == "frontier" and selected_fir is None:
                 assert ls_fir is not None
-                selected_fir = {
-                    "fir": ls_fir,
-                    "used_method": "frontier cvxpy",
-                    "metrics": frontier_metrics or {},
-                }
-            else:
+                selected_fir = choose_frontier_fir_with_fallback(
+                    freq,
+                    after_peq,
+                    target_db,
+                    masks[key],
+                    fallback_enabled=fir_ls_fallback == "on",
+                    frontier_fir=ls_fir,
+                    frontier_metrics=frontier_metrics or {},
+                    legacy_fir=legacy_fir,
+                    guardrail_fir=flat_delay_fir(FIR_TAPS[key]),
+                    boost_cap_db=fir_boost_cap if key == "sub" else None,
+                    peq_response=peq_resp,
+                )
+                selected_metrics = selected_fir["metrics"]  # type: ignore[index]
+                if (
+                    isinstance(selected_metrics, dict)
+                    and not selected_metrics.get("frontier_accepted", False)
+                    and fir_ls_fallback == "on"
+                ):
+                    frontier_disabled_reason = f"frontier_disabled_after_{key}_rejected"
+            elif optimizer_mode != "frontier":
                 selected_fir = choose_fir_with_fallback(
                     freq,
                     after_peq,
@@ -2085,6 +2382,7 @@ def build_final_filter_system(
                     boost_cap_db=fir_boost_cap if key == "sub" else None,
                     peq_response=peq_resp,
                 )
+            assert selected_fir is not None
             fir = selected_fir["fir"]  # type: ignore[assignment]
             f_resp = fir_response(fir, freq)
             after_all = after_peq * f_resp
@@ -2414,6 +2712,24 @@ def build_report(
         lines.append("- FIR requested: legacy smoothed magnitude inverse via frequency sampling and windowed truncation.")
     for result in results:
         lines.append(f"- {result.title} FIR used: {result.fir_used_method}.")
+        if result.fir_requested_method == "frontier":
+            metrics = result.fir_metrics or {}
+            accepted = "yes" if metrics.get("frontier_accepted") else "no"
+            reason = str(metrics.get("frontier_rejection_reason", ""))
+            status = str(metrics.get("status", "unknown"))
+            max_boost = float(metrics.get("dense_max_boost_db", 0.0))
+            max_boost_hz = float(metrics.get("dense_max_boost_hz", 0.0))
+            over_cap = float(metrics.get("dense_boost_over_cap_db", 0.0))
+            refinements = float(metrics.get("safety_refinement_iterations", 0.0))
+            detail = (
+                f"- {result.title} frontier accepted: {accepted}; solver status {status}; "
+                f"dense max FIR boost {max_boost:+.2f} dB at {max_boost_hz:.1f} Hz; "
+                f"dense boost over cap {over_cap:+.2f} dB; safety refinements {refinements:.0f}"
+            )
+            if reason:
+                detail += f"; rejection reason: {reason}"
+            detail += "."
+            lines.append(detail)
     lines.append(
         f"- FIR target delay compensation: Sub FIR target delay is "
         f"{fir_group_delay_ms(FIR_TAPS['sub']) - fir_group_delay_ms(FIR_TAPS['left']):.3f} ms "
@@ -2839,45 +3155,41 @@ def main() -> int:
         sub_highpass_hz=args.sub_highpass_hz,
     )
     system_cache: Dict[Tuple[float, float, float], Dict[str, object]] = {}
-    frontier_selection_cache: Dict[Tuple[float, float, float], Dict[str, object]] = {}
-
-    def candidate_key(candidate: Dict[str, float]) -> Tuple[float, float, float]:
-        return (
-            round(float(candidate["crossover_hz"]), 6),
-            round(float(candidate["sub_delay_ms"]), 6),
-            round(float(candidate["sub_gain_db"]), 6),
-        )
+    exact_build_kwargs = {
+        "freq": freq,
+        "avg": avg,
+        "target_db": shifted_target_db,
+        "sub_low_freq": args.sub_low_freq,
+        "sub_highpass_hz": args.sub_highpass_hz,
+        "distortion": distortion,
+        "fir_method": args.fir_method,
+        "fir_ls_grid_points": args.fir_ls_grid_points,
+        "fir_ls_lambda": args.fir_ls_lambda,
+        "fir_ls_max_boost_db": args.fir_ls_max_boost_db,
+        "fir_ls_max_cut_db": args.fir_ls_max_cut_db,
+        "fir_ls_phase_mode": args.fir_ls_phase_mode,
+        "fir_ls_fallback": args.fir_ls_fallback,
+        "gain_refinement_enabled": args.gain_refinement == "on",
+        "crossover_preference_hz": args.prefer_crossover,
+        "optimizer_mode": args.optimizer_mode,
+        "multipoint": multipoint if args.optimizer_mode == "frontier" else None,
+        "frontier_max_filter_energy_db": args.max_filter_energy_db,
+        "frontier_pre_ringing_limit_db": args.pre_ringing_limit_db,
+    }
+    exact_score_kwargs = {
+        "freq": freq,
+        "lsum_measured": avg["left_sum"],
+        "rsum_measured": avg["right_sum"],
+        "target_db": shifted_target_db,
+        "crossover_preference_hz": args.prefer_crossover,
+    }
 
     def exact_scorer(candidate: Dict[str, float]) -> Dict[str, float]:
-        key = candidate_key(candidate)
-        if key not in system_cache:
-            system_cache[key] = build_final_filter_system(
-                freq=freq,
-                avg=avg,
-                target_db=shifted_target_db,
-                crossover=candidate,
-                sub_low_freq=args.sub_low_freq,
-                sub_highpass_hz=args.sub_highpass_hz,
-                distortion=distortion,
-                fir_method=args.fir_method,
-                fir_ls_grid_points=args.fir_ls_grid_points,
-                fir_ls_lambda=args.fir_ls_lambda,
-                fir_ls_max_boost_db=args.fir_ls_max_boost_db,
-                fir_ls_max_cut_db=args.fir_ls_max_cut_db,
-                fir_ls_phase_mode=args.fir_ls_phase_mode,
-                fir_ls_fallback=args.fir_ls_fallback,
-                gain_refinement_enabled=args.gain_refinement == "on",
-                crossover_preference_hz=args.prefer_crossover,
-                optimizer_mode="heuristic",
-            )
-        return score_final_system_candidate(
-            freq=freq,
-            final_channels=system_cache[key]["final_channels"],  # type: ignore[arg-type]
-            lsum_measured=avg["left_sum"],
-            rsum_measured=avg["right_sum"],
-            target_db=shifted_target_db,
-            crossover_hz=float(candidate["crossover_hz"]),
-            crossover_preference_hz=args.prefer_crossover,
+        return score_exact_candidate_system(
+            candidate,
+            cache=system_cache,
+            build_kwargs=exact_build_kwargs,
+            score_kwargs=exact_score_kwargs,
         )
 
     crossover = select_exact_crossover_candidate(
@@ -2885,31 +3197,8 @@ def main() -> int:
         exact_scorer=exact_scorer,
         max_candidates=args.exact_candidates,
     )
-    selected_key = candidate_key(crossover)
-    if args.optimizer_mode == "frontier":
-        frontier_selection_cache[selected_key] = build_final_filter_system(
-            freq=freq,
-            avg=avg,
-            target_db=shifted_target_db,
-            crossover=crossover,
-            sub_low_freq=args.sub_low_freq,
-            sub_highpass_hz=args.sub_highpass_hz,
-            distortion=distortion,
-            fir_method=args.fir_method,
-            fir_ls_grid_points=args.fir_ls_grid_points,
-            fir_ls_lambda=args.fir_ls_lambda,
-            fir_ls_max_boost_db=args.fir_ls_max_boost_db,
-            fir_ls_max_cut_db=args.fir_ls_max_cut_db,
-            fir_ls_phase_mode=args.fir_ls_phase_mode,
-            fir_ls_fallback=args.fir_ls_fallback,
-            gain_refinement_enabled=args.gain_refinement == "on",
-            crossover_preference_hz=args.prefer_crossover,
-            optimizer_mode="frontier",
-            multipoint=multipoint,
-            frontier_max_filter_energy_db=args.max_filter_energy_db,
-            frontier_pre_ringing_limit_db=args.pre_ringing_limit_db,
-        )
-    selected_system = frontier_selection_cache.get(selected_key, system_cache[selected_key])
+    selected_key = candidate_cache_key(crossover)
+    selected_system = system_cache[selected_key]
     fc = float(crossover["crossover_hz"])
     delays = selected_system["delays"]  # type: ignore[assignment]
     gains = selected_system["gains"]  # type: ignore[assignment]

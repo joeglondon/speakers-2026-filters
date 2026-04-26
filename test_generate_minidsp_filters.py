@@ -111,6 +111,100 @@ class GenerateMiniDSPFiltersTests(unittest.TestCase):
         self.assertEqual(metadata["clarabel_error"], "forced CLARABEL failure")
         self.assertTrue(np.all(np.isfinite(fir)))
 
+    def test_frontier_dense_guardrail_detects_peak_missed_between_sparse_design_points(self):
+        freq = np.linspace(2_000.0, 2_800.0, 801)
+        sparse_freq = np.asarray([2_000.0, 2_800.0])
+        center_hz = 2_400.0
+        taps = 512
+        n = np.arange(taps, dtype=np.float64)
+        fir = np.cos(2.0 * np.pi * center_hz * n / gen.OUT_FS) * np.hamming(taps)
+        fir *= (10.0 ** (12.0 / 20.0)) / abs(gen.fir_response(fir, np.asarray([center_hz]))[0])
+        mask = np.ones_like(freq, dtype=bool)
+        cap = np.full_like(freq, 3.0)
+
+        sparse_boost = gen.db(gen.fir_response(fir, sparse_freq))
+        metrics = gen.dense_fir_guardrail_metrics(freq, fir, mask, boost_cap_db=cap)
+
+        self.assertLess(float(np.max(sparse_boost)), 3.25)
+        self.assertGreater(metrics["dense_boost_over_cap_db"], 6.0)
+        self.assertAlmostEqual(metrics["dense_max_boost_hz"], center_hz, delta=5.0)
+
+    def test_frontier_fallback_uses_legacy_when_frontier_worsens_channel_rms(self):
+        freq = np.asarray([100.0, 200.0, 400.0])
+        target_db = np.zeros_like(freq)
+        after_peq = np.ones_like(freq, dtype=np.complex128)
+        mask = np.ones_like(freq, dtype=bool)
+        frontier_fir = np.asarray([2.0])
+        legacy_fir = np.asarray([1.0])
+
+        selected = gen.choose_frontier_fir_with_fallback(
+            freq,
+            after_peq,
+            target_db,
+            mask,
+            fallback_enabled=True,
+            frontier_fir=frontier_fir,
+            frontier_metrics={
+                "status": "optimal",
+                "dense_boost_over_cap_db": 0.0,
+            },
+            legacy_fir=legacy_fir,
+        )
+
+        self.assertEqual(selected["used_method"], "legacy fallback")
+        self.assertIs(selected["fir"], legacy_fir)
+        self.assertFalse(selected["metrics"]["frontier_accepted"])
+        self.assertEqual(selected["metrics"]["frontier_rejection_reason"], "frontier_worse_than_reliable")
+
+    def test_frontier_fallback_rejects_optimal_inaccurate_status(self):
+        freq = np.asarray([100.0, 200.0, 400.0])
+        target_db = np.zeros_like(freq)
+        after_peq = np.ones_like(freq, dtype=np.complex128)
+        mask = np.ones_like(freq, dtype=bool)
+        frontier_fir = np.asarray([1.0])
+        legacy_fir = np.asarray([1.0])
+
+        selected = gen.choose_frontier_fir_with_fallback(
+            freq,
+            after_peq,
+            target_db,
+            mask,
+            fallback_enabled=True,
+            frontier_fir=frontier_fir,
+            frontier_metrics={
+                "status": "optimal_inaccurate",
+                "dense_boost_over_cap_db": 0.0,
+            },
+            legacy_fir=legacy_fir,
+        )
+
+        self.assertEqual(selected["used_method"], "legacy fallback")
+        self.assertFalse(selected["metrics"]["frontier_accepted"])
+        self.assertEqual(selected["metrics"]["frontier_rejection_reason"], "solver_status: optimal_inaccurate")
+
+    def test_frontier_fallback_raises_when_fallback_disabled(self):
+        freq = np.asarray([100.0, 200.0, 400.0])
+        target_db = np.zeros_like(freq)
+        after_peq = np.ones_like(freq, dtype=np.complex128)
+        mask = np.ones_like(freq, dtype=bool)
+
+        with self.assertRaisesRegex(ValueError, "Frontier FIR rejected"):
+            gen.choose_frontier_fir_with_fallback(
+                freq,
+                after_peq,
+                target_db,
+                mask,
+                fallback_enabled=False,
+                frontier_fir=np.asarray([2.0]),
+                frontier_metrics={
+                    "status": "optimal",
+                    "dense_boost_over_cap_db": 20.0,
+                    "dense_max_boost_db": 23.0,
+                    "dense_max_boost_hz": 200.0,
+                },
+                legacy_fir=np.asarray([1.0]),
+            )
+
     def test_multipoint_score_uses_80th_percentile_not_only_average(self):
         freq = np.asarray([80.0, 100.0, 120.0])
         target = np.zeros_like(freq)
@@ -167,8 +261,64 @@ class GenerateMiniDSPFiltersTests(unittest.TestCase):
 
         for result in system["results"]:
             self.assertEqual(result.fir_requested_method, "frontier")
-            self.assertEqual(result.fir_used_method, "frontier cvxpy")
+            self.assertIn(result.fir_used_method, {"frontier cvxpy", "legacy fallback", "flat guardrail fallback"})
+            self.assertIn("frontier_accepted", result.fir_metrics)
             self.assertIn("multipoint_score", result.fir_metrics)
+
+    def test_frontier_final_system_records_rejection_metadata_when_falling_back(self):
+        freq = np.geomspace(40.0, 500.0, 80)
+        target = np.zeros_like(freq)
+        flat = np.ones_like(freq, dtype=np.complex128)
+        responses = {
+            "left": [flat.copy(), flat.copy()],
+            "right": [flat.copy(), flat.copy()],
+            "sub": [flat.copy(), flat.copy()],
+            "left_sum": [flat * 2.0, flat * 2.0],
+            "right_sum": [flat * 2.0, flat * 2.0],
+        }
+        multipoint = gen.MultiPointResponses(freq=freq, responses=responses)
+        avg = {key: multipoint.average(key) for key in responses}
+        original_taps = dict(gen.FIR_TAPS)
+
+        def unsafe_frontier(*args, **kwargs):
+            fir = gen.flat_delay_fir(args[3]) * 2.0
+            return fir, {
+                "method": "cvxpy",
+                "solver": "CLARABEL",
+                "status": "optimal",
+                "dense_boost_over_cap_db": 3.0,
+                "dense_max_boost_db": 6.0,
+                "dense_max_boost_hz": 100.0,
+            }
+
+        try:
+            gen.FIR_TAPS.update({"left": 48, "right": 48, "sub": 48})
+            with mock.patch.object(gen, "make_frontier_fir", unsafe_frontier):
+                system = gen.build_final_filter_system(
+                    freq=freq,
+                    avg=avg,
+                    target_db=target,
+                    crossover={"crossover_hz": 100.0, "sub_delay_ms": 0.0, "sub_gain_db": 0.0},
+                    sub_low_freq=40.0,
+                    sub_highpass_hz=0.0,
+                    fir_ls_grid_points=96,
+                    fir_ls_max_boost_db=2.0,
+                    optimizer_mode="frontier",
+                    multipoint=multipoint,
+                    gain_refinement_enabled=False,
+                )
+        finally:
+            gen.FIR_TAPS.clear()
+            gen.FIR_TAPS.update(original_taps)
+
+        reasons = []
+        for result in system["results"]:
+            self.assertEqual(result.fir_requested_method, "frontier")
+            self.assertIn(result.fir_used_method, {"legacy fallback", "flat guardrail fallback"})
+            self.assertFalse(result.fir_metrics["frontier_accepted"])
+            reasons.append(result.fir_metrics["frontier_rejection_reason"])
+        self.assertEqual(reasons[0], "dense_guardrail_violation")
+        self.assertTrue(all(reason for reason in reasons))
 
     def test_complex_from_spl_trust_exports_does_not_apply_mic_correction(self):
         measurement = gen.SPLMeasurement(
@@ -771,6 +921,49 @@ class GenerateMiniDSPFiltersTests(unittest.TestCase):
         self.assertEqual(selected["exact_candidate_limit"], 17)
         self.assertEqual(selected["exact_candidates_scored"], 17)
         self.assertEqual(len(selected["top_candidates"]), 17)
+
+    def test_exact_candidate_scorer_uses_requested_optimizer_mode(self):
+        freq = np.asarray([80.0, 100.0, 120.0])
+        target = np.full(freq.shape, 6.020599913279624)
+        measured_sum = np.full(freq.shape, 2.0 + 0.0j)
+        candidate = {"crossover_hz": 100.0, "sub_delay_ms": 0.0, "sub_gain_db": 0.0}
+        cache = {}
+        calls = []
+
+        def builder(**kwargs):
+            calls.append(kwargs["optimizer_mode"])
+            return {
+                "final_channels": {
+                    "left": np.ones(freq.shape, dtype=np.complex128),
+                    "right": np.ones(freq.shape, dtype=np.complex128),
+                    "sub": np.ones(freq.shape, dtype=np.complex128),
+                }
+            }
+
+        score = gen.score_exact_candidate_system(
+            candidate,
+            cache=cache,
+            build_kwargs={
+                "freq": freq,
+                "avg": {},
+                "target_db": target,
+                "sub_low_freq": 40.0,
+                "sub_highpass_hz": 0.0,
+                "optimizer_mode": "frontier",
+                "multipoint": object(),
+            },
+            score_kwargs={
+                "freq": freq,
+                "lsum_measured": measured_sum,
+                "rsum_measured": measured_sum,
+                "target_db": target,
+                "crossover_preference_hz": None,
+            },
+            builder=builder,
+        )
+
+        self.assertEqual(calls, ["frontier"])
+        self.assertLess(score["score"], 1e-6)
 
     def test_crossover_selection_metadata_records_selected_and_exact_rows(self):
         selected = {
