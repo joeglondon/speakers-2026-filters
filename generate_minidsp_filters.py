@@ -674,6 +674,55 @@ def target_shift(
     return float(np.mean(measured - target_db[mask]))
 
 
+def room_curve_db(
+    freq: np.ndarray,
+    lf_rise_start_hz: float = 200.0,
+    lf_rise_end_hz: float = 20.0,
+    lf_rise_slope_db_per_octave: float = 1.0,
+    hf_fall_start_hz: float = 1000.0,
+    hf_fall_slope_db_per_octave: float = 0.5,
+) -> np.ndarray:
+    if lf_rise_start_hz <= 0.0 or lf_rise_end_hz <= 0.0 or hf_fall_start_hz <= 0.0:
+        raise ValueError("Room-curve frequencies must be positive.")
+    if lf_rise_end_hz > lf_rise_start_hz:
+        raise ValueError("LF rise end must be less than or equal to LF rise start.")
+    if lf_rise_slope_db_per_octave < 0.0 or hf_fall_slope_db_per_octave < 0.0:
+        raise ValueError("Room-curve slopes must be non-negative.")
+
+    safe_freq = np.maximum(np.asarray(freq, dtype=np.float64), EPS)
+    curve = np.zeros_like(safe_freq, dtype=np.float64)
+
+    lf_octaves = np.log2(lf_rise_start_hz / np.maximum(safe_freq, lf_rise_end_hz))
+    curve += np.where(safe_freq < lf_rise_start_hz, lf_rise_slope_db_per_octave * lf_octaves, 0.0)
+
+    hf_octaves = np.log2(safe_freq / hf_fall_start_hz)
+    curve -= np.where(safe_freq > hf_fall_start_hz, hf_fall_slope_db_per_octave * hf_octaves, 0.0)
+    return curve
+
+
+def apply_room_curve(
+    freq: np.ndarray,
+    target_db: np.ndarray,
+    enabled: bool = False,
+    lf_rise_start_hz: float = 200.0,
+    lf_rise_end_hz: float = 20.0,
+    lf_rise_slope_db_per_octave: float = 1.0,
+    hf_fall_start_hz: float = 1000.0,
+    hf_fall_slope_db_per_octave: float = 0.5,
+) -> np.ndarray:
+    target = np.asarray(target_db, dtype=np.float64)
+    if not enabled:
+        return target.copy()
+    return target + room_curve_db(
+        freq,
+        lf_rise_start_hz=lf_rise_start_hz,
+        lf_rise_end_hz=lf_rise_end_hz,
+        lf_rise_slope_db_per_octave=lf_rise_slope_db_per_octave,
+        hf_fall_start_hz=hf_fall_start_hz,
+        hf_fall_slope_db_per_octave=hf_fall_slope_db_per_octave,
+    )
+
+
 def choose_channel_gain(
     freq: np.ndarray,
     response: np.ndarray,
@@ -2272,10 +2321,21 @@ def correction_masks(
     freq: np.ndarray, crossover_hz: float, sub_low_freq: float = 20.0
 ) -> Dict[str, np.ndarray]:
     return {
-        "left": (freq >= max(crossover_hz * 0.85, 60.0)) & (freq <= 18_000.0),
-        "right": (freq >= max(crossover_hz * 0.85, 60.0)) & (freq <= 18_000.0),
-        "sub": (freq >= sub_low_freq) & (freq <= min(crossover_hz * 1.8, 180.0)),
+        "left": (freq >= crossover_hz) & (freq <= 18_000.0),
+        "right": (freq >= crossover_hz) & (freq <= 18_000.0),
+        "sub": (freq >= sub_low_freq) & (freq <= crossover_hz),
     }
+
+
+def correction_band_metadata(freq: np.ndarray, masks: Dict[str, np.ndarray]) -> Dict[str, Dict[str, float]]:
+    bands: Dict[str, Dict[str, float]] = {}
+    for key, mask in masks.items():
+        active = freq[np.asarray(mask, dtype=bool)]
+        if active.size:
+            bands[key] = {"low_hz": float(active[0]), "high_hz": float(active[-1])}
+        else:
+            bands[key] = {"low_hz": 0.0, "high_hz": 0.0}
+    return bands
 
 
 def build_final_filter_system(
@@ -2570,6 +2630,7 @@ def build_final_filter_system(
     return {
         "fc": fc,
         "masks": masks,
+        "correction_bands": correction_band_metadata(freq, masks),
         "sub_hp_filters": sub_hp_filters,
         "xover": xover,
         "delays": delays,
@@ -2738,6 +2799,8 @@ def build_report(
     sub_low_freq: float,
     target_offset_db: float,
     target_absolute: bool,
+    room_curve_settings: Dict[str, float | bool],
+    correction_bands: Dict[str, Dict[str, float]],
     delays: Dict[str, float],
     gains: Dict[str, float],
     results: Sequence[ChannelResult],
@@ -2764,6 +2827,13 @@ def build_report(
     else:
         lines.append("- Sub protective high-pass: none")
     lines.append(f"- Sub correction lower limit: {sub_low_freq:g} Hz")
+    if correction_bands:
+        lines.append(
+            "- Correction bands: "
+            f"Left {correction_bands['left']['low_hz']:.1f}-{correction_bands['left']['high_hz']:.1f} Hz; "
+            f"Right {correction_bands['right']['low_hz']:.1f}-{correction_bands['right']['high_hz']:.1f} Hz; "
+            f"Sub {correction_bands['sub']['low_hz']:.1f}-{correction_bands['sub']['high_hz']:.1f} Hz."
+        )
     lines.append(f"- Sub relative gain from crossover search: {crossover['sub_gain_db']:+.2f} dB")
     lines.append(f"- Sub relative delay from crossover search: {crossover['sub_delay_ms']:+.2f} ms")
     lines.append(
@@ -2772,6 +2842,17 @@ def build_report(
     )
     if boundary_warning:
         lines.append(f"- Crossover search warning: {boundary_warning}")
+    if room_curve_settings.get("enabled"):
+        lines.append(
+            "- Room curve overlay: "
+            f"LF +{float(room_curve_settings['lf_rise_slope_db_per_octave']):.2f} dB/oct "
+            f"from {float(room_curve_settings['lf_rise_start_hz']):g} Hz down to "
+            f"{float(room_curve_settings['lf_rise_end_hz']):g} Hz; "
+            f"HF -{float(room_curve_settings['hf_fall_slope_db_per_octave']):.2f} dB/oct "
+            f"above {float(room_curve_settings['hf_fall_start_hz']):g} Hz."
+        )
+    else:
+        lines.append("- Room curve overlay: off.")
     lines.append(f"- Mic calibration policy: {mic_cal_policy}. {mic_compare_note}")
     lines.append("- PEQ selection: greedy seeds refined with bounded SciPy soft-L1 least squares.")
     frontier_requested = any(result.fir_requested_method == "frontier" for result in results)
@@ -3040,6 +3121,42 @@ def main() -> int:
         help="Use the target file's absolute SPL instead of shifting it to the measurement level.",
     )
     parser.add_argument(
+        "--room-curve",
+        choices=("on", "off"),
+        default="off",
+        help="Overlay a REW-style room curve on top of the target before level shifting.",
+    )
+    parser.add_argument(
+        "--room-curve-lf-start-hz",
+        type=float,
+        default=200.0,
+        help="Room-curve LF rise start frequency.",
+    )
+    parser.add_argument(
+        "--room-curve-lf-end-hz",
+        type=float,
+        default=20.0,
+        help="Room-curve LF rise end frequency; rise is held below this point.",
+    )
+    parser.add_argument(
+        "--room-curve-lf-slope-db-per-octave",
+        type=float,
+        default=1.0,
+        help="Room-curve LF rise slope in dB/octave.",
+    )
+    parser.add_argument(
+        "--room-curve-hf-start-hz",
+        type=float,
+        default=1000.0,
+        help="Room-curve HF fall start frequency.",
+    )
+    parser.add_argument(
+        "--room-curve-hf-slope-db-per-octave",
+        type=float,
+        default=0.5,
+        help="Room-curve HF fall slope in dB/octave.",
+    )
+    parser.add_argument(
         "--mic-cal-policy",
         choices=("trust-exports", "apply", "compare"),
         default="trust-exports",
@@ -3174,7 +3291,26 @@ def main() -> int:
     distortion = parse_distortion_file(root / "Distortion" / "Distortion.txt")
 
     freq = spl["L 1"].freq
-    target_db = interp_curve(freq, target_freq, target_raw_db)
+    target_base_db = interp_curve(freq, target_freq, target_raw_db)
+    room_curve_enabled = args.room_curve == "on"
+    room_curve_settings = {
+        "enabled": room_curve_enabled,
+        "lf_rise_start_hz": float(args.room_curve_lf_start_hz),
+        "lf_rise_end_hz": float(args.room_curve_lf_end_hz),
+        "lf_rise_slope_db_per_octave": float(args.room_curve_lf_slope_db_per_octave),
+        "hf_fall_start_hz": float(args.room_curve_hf_start_hz),
+        "hf_fall_slope_db_per_octave": float(args.room_curve_hf_slope_db_per_octave),
+    }
+    target_db = apply_room_curve(
+        freq,
+        target_base_db,
+        enabled=room_curve_enabled,
+        lf_rise_start_hz=args.room_curve_lf_start_hz,
+        lf_rise_end_hz=args.room_curve_lf_end_hz,
+        lf_rise_slope_db_per_octave=args.room_curve_lf_slope_db_per_octave,
+        hf_fall_start_hz=args.room_curve_hf_start_hz,
+        hf_fall_slope_db_per_octave=args.room_curve_hf_slope_db_per_octave,
+    )
 
     groups = {
         "left": group_names("L"),
@@ -3290,6 +3426,7 @@ def main() -> int:
     final_channels = selected_system["final_channels"]  # type: ignore[assignment]
     crossover_filters = selected_system["crossover_filters"]  # type: ignore[assignment]
     gain_refinement = selected_system["gain_refinement"]  # type: ignore[assignment]
+    correction_bands = selected_system["correction_bands"]  # type: ignore[assignment]
     multipoint_validation = (
         multipoint_final_validation(
             freq,
@@ -3405,6 +3542,8 @@ def main() -> int:
         sub_low_freq=args.sub_low_freq,
         target_offset_db=shift,
         target_absolute=args.absolute_target,
+        room_curve_settings=room_curve_settings,
+        correction_bands=correction_bands,
         delays=delays,
         gains=gains,
         results=results,
@@ -3432,6 +3571,8 @@ def main() -> int:
         "exact_crossover_selection": crossover_selection_metadata(crossover),
         "crossover_boundary_warning": boundary_warning,
         "target_offset_db": shift,
+        "room_curve": room_curve_settings,
+        "correction_bands": correction_bands,
         "delays_ms": delays,
         "fir_group_delays_ms": {
             "left": fir_group_delay_ms(FIR_TAPS["left"]),

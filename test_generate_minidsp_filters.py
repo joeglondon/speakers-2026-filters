@@ -9,6 +9,77 @@ import generate_minidsp_filters as gen
 
 
 class GenerateMiniDSPFiltersTests(unittest.TestCase):
+    def test_room_curve_matches_rew_style_lf_rise_and_hf_fall(self):
+        freq = np.asarray([10.0, 20.0, 40.0, 200.0, 1000.0, 2000.0, 4000.0])
+
+        curve = gen.room_curve_db(
+            freq,
+            lf_rise_start_hz=200.0,
+            lf_rise_end_hz=20.0,
+            lf_rise_slope_db_per_octave=1.0,
+            hf_fall_start_hz=1000.0,
+            hf_fall_slope_db_per_octave=0.5,
+        )
+
+        np.testing.assert_allclose(
+            curve,
+            np.asarray(
+                [
+                    math.log2(200.0 / 20.0),
+                    math.log2(200.0 / 20.0),
+                    math.log2(200.0 / 40.0),
+                    0.0,
+                    0.0,
+                    -0.5,
+                    -1.0,
+                ]
+            ),
+            atol=1e-12,
+        )
+
+    def test_apply_room_curve_adds_overlay_to_target(self):
+        freq = np.asarray([20.0, 200.0, 2000.0])
+        target = np.asarray([70.0, 70.0, 70.0])
+
+        adjusted = gen.apply_room_curve(
+            freq,
+            target,
+            enabled=True,
+            lf_rise_start_hz=200.0,
+            lf_rise_end_hz=20.0,
+            lf_rise_slope_db_per_octave=1.0,
+            hf_fall_start_hz=1000.0,
+            hf_fall_slope_db_per_octave=0.5,
+        )
+
+        np.testing.assert_allclose(adjusted, np.asarray([70.0 + math.log2(10.0), 70.0, 69.5]))
+
+    def test_apply_room_curve_can_be_disabled(self):
+        freq = np.asarray([20.0, 200.0, 2000.0])
+        target = np.asarray([70.0, 71.0, 72.0])
+
+        adjusted = gen.apply_room_curve(freq, target, enabled=False)
+
+        np.testing.assert_allclose(adjusted, target)
+
+    def test_correction_masks_follow_crossover_passbands(self):
+        freq = np.asarray([20.0, 80.0, 125.0, 126.0, 127.0, 180.0, 1000.0, 20_000.0])
+
+        masks = gen.correction_masks(freq, crossover_hz=126.0, sub_low_freq=20.0)
+
+        np.testing.assert_array_equal(
+            masks["left"],
+            np.asarray([False, False, False, True, True, True, True, False]),
+        )
+        np.testing.assert_array_equal(
+            masks["right"],
+            np.asarray([False, False, False, True, True, True, True, False]),
+        )
+        np.testing.assert_array_equal(
+            masks["sub"],
+            np.asarray([True, True, True, True, False, False, False, False]),
+        )
+
     def test_multipoint_dataset_preserves_positions_and_provides_average(self):
         freq = np.asarray([100.0, 200.0])
         responses = {
