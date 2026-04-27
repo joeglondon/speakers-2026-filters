@@ -861,6 +861,10 @@ def seed_peak_filters(
     correction_mask: np.ndarray,
     max_filters: int = MAX_PEQ_FILTERS,
     boost_cap_db: np.ndarray | None = None,
+    min_error_db: float = 2.0,
+    cut_gain_factor: float = 0.75,
+    boost_gain_factor: float = 0.35,
+    remove_level_offset: bool = False,
 ) -> List[Biquad]:
     filters: List[Biquad] = []
     current = response.copy()
@@ -873,6 +877,8 @@ def seed_peak_filters(
 
     for _ in range(max_filters):
         error = db(current) - target_db
+        if remove_level_offset and np.any(correction_mask):
+            error = error - float(np.median(error[correction_mask]))
         smooth_error = smooth_log(error, freq, width_oct=1 / 5)
         masked = np.where(correction_mask, smooth_error, 0.0)
         cut_idx = int(np.argmax(masked))
@@ -882,13 +888,13 @@ def seed_peak_filters(
         boost_idx = int(np.argmax(dip))
         boost_amount = dip[boost_idx]
 
-        if cut_amount >= 2.0 and cut_amount >= boost_amount * 0.65:
+        if cut_amount >= min_error_db and cut_amount >= boost_amount * 0.65:
             idx = cut_idx
-            gain = -float(np.clip(cut_amount * 0.75, 1.0, 9.0))
-        elif boost_amount >= 2.0:
+            gain = -float(np.clip(cut_amount * cut_gain_factor, 0.5, 9.0))
+        elif boost_amount >= min_error_db:
             idx = boost_idx
             # Boost gently and avoid trying to fill nulls.
-            gain = float(np.clip(boost_amount * 0.35, 0.5, min(3.0, boost_cap[idx])))
+            gain = float(np.clip(boost_amount * boost_gain_factor, 0.25, min(3.0, boost_cap[idx])))
         else:
             break
 
@@ -1032,6 +1038,9 @@ def optimize_peak_filters(
     boost_cap_db: np.ndarray | None = None,
     boost_cap_penalty_weight: float = 8.0,
     peq_cumulative_boost_cap_db: float = 5.0,
+    prune_max_rms_worsening_db: float = 0.2,
+    remove_level_offset: bool = False,
+    prefer_seed_if_within_db: float = 0.0,
     fs: float = OUT_FS,
 ) -> PeqOptimizationResult:
     """Refine all PEQ parameters together with bounded robust least squares."""
@@ -1052,6 +1061,8 @@ def optimize_peak_filters(
     fit_grid = np.geomspace(lo_freq, hi_freq, grid_points)
     base_db = np.interp(fit_grid, freq, db(response))
     fit_target_db = np.interp(fit_grid, freq, target_db)
+    if remove_level_offset:
+        fit_target_db = fit_target_db + float(np.median(base_db - fit_target_db))
     boost_cap_grid_db = (
         np.interp(fit_grid, freq, np.asarray(boost_cap_db, dtype=np.float64))
         if boost_cap_db is not None
@@ -1127,15 +1138,17 @@ def optimize_peak_filters(
         cumulative_boost_cap_full,
         fs,
     )
+    richer_seed_for_fallback = list(seed_for_fallback)
     seed_for_fallback = prune_redundant_peq_filters(
         seed_for_fallback,
         freq,
         response,
-        target_db,
+        target_db + (float(np.median(db(response[mask]) - target_db[mask])) if remove_level_offset else 0.0),
         correction_mask,
-        max_rms_worsening_db=0.2,
+        max_rms_worsening_db=prune_max_rms_worsening_db,
         fs=fs,
     )
+    richer_seed_rms = _peq_rms_error(richer_seed_for_fallback, fit_grid, base_db, fit_target_db)
     seed_rms = _peq_rms_error(seed_for_fallback, fit_grid, base_db, fit_target_db)
 
     def penalty_residuals(filters: Sequence[Biquad]) -> List[float]:
@@ -1199,12 +1212,22 @@ def optimize_peak_filters(
         stable_filters,
         freq,
         response,
-        target_db,
+        target_db + (float(np.median(db(response[mask]) - target_db[mask])) if remove_level_offset else 0.0),
         correction_mask,
-        max_rms_worsening_db=0.2,
+        max_rms_worsening_db=prune_max_rms_worsening_db,
         fs=fs,
     )
     refined_rms = _peq_rms_error(stable_filters, fit_grid, base_db, fit_target_db)
+    if (
+        prefer_seed_if_within_db > 0.0
+        and len(richer_seed_for_fallback) > len(stable_filters)
+        and np.isfinite(seed_rms)
+        and np.isfinite(refined_rms)
+        and np.isfinite(richer_seed_rms)
+        and richer_seed_rms <= refined_rms + prefer_seed_if_within_db
+    ):
+        stable_filters = richer_seed_for_fallback
+        refined_rms = richer_seed_rms
     if not stable_filters and seed_filters:
         refined_rms = rms(base_db - fit_target_db)
     if not np.isfinite(refined_rms) or refined_rms > seed_rms:
@@ -1213,9 +1236,9 @@ def optimize_peak_filters(
             stable_filters,
             freq,
             response,
-            target_db,
+            target_db + (float(np.median(db(response[mask]) - target_db[mask])) if remove_level_offset else 0.0),
             correction_mask,
-            max_rms_worsening_db=0.2,
+            max_rms_worsening_db=prune_max_rms_worsening_db,
             fs=fs,
         )
         refined_rms = seed_rms
@@ -1242,7 +1265,20 @@ def find_peak_filters(
     return optimize_peak_filters(freq, response, target_db, correction_mask, seed, distortion).filters
 
 
-def peq_optimization_metadata(result: PeqOptimizationResult) -> Dict[str, object]:
+def peq_optimization_metadata(
+    result: PeqOptimizationResult,
+    seed_settings: Dict[str, float] | None = None,
+) -> Dict[str, object]:
+    pruning_worsening = (
+        float(seed_settings["prune_max_rms_worsening_db"])
+        if seed_settings is not None
+        else 0.2
+    )
+    cumulative_boost_cap = (
+        float(seed_settings["cumulative_boost_cap_db"])
+        if seed_settings is not None
+        else 5.0
+    )
     return {
         "method": "scipy.optimize.least_squares",
         "loss": "soft_l1",
@@ -1252,11 +1288,12 @@ def peq_optimization_metadata(result: PeqOptimizationResult) -> Dict[str, object
             "gain_db": [-9.0, 3.0],
             "frequency_hz": "channel correction mask",
         },
-        "cumulative_boost_cap_db": 5.0,
+        "cumulative_boost_cap_db": cumulative_boost_cap,
         "redundant_filter_pruning": {
             "same_sign_octaves": 1.0 / 3.0,
-            "max_rms_worsening_db": 0.2,
+            "max_rms_worsening_db": pruning_worsening,
         },
+        "seed_settings": seed_settings,
         "seed_rms_db": result.seed_rms_db,
         "refined_rms_db": result.refined_rms_db,
         "success": result.success,
@@ -2266,6 +2303,10 @@ def select_exact_crossover_candidate(
     candidates: Sequence[Dict[str, float]],
     exact_scorer,
     max_candidates: int = 8,
+    boundary_reluctance_db: float = 0.12,
+    boundary_margin_hz: float = 0.5,
+    min_crossover_hz: float | None = None,
+    max_crossover_hz: float | None = None,
 ) -> Dict[str, float]:
     shortlist: List[Dict[str, float]] = []
     sorted_candidates = sorted(candidates, key=lambda row: row["score"])
@@ -2291,7 +2332,25 @@ def select_exact_crossover_candidate(
             row[f"exact_{key}"] = float(value)
         exact_rows.append(row)
 
-    best = dict(min(exact_rows, key=lambda row: row["exact_score"]))
+    exact_sorted = sorted(exact_rows, key=lambda row: row["exact_score"])
+    best = dict(exact_sorted[0])
+    candidate_fcs = [float(row["crossover_hz"]) for row in candidates]
+    min_fc = float(min_crossover_hz) if min_crossover_hz is not None else min(candidate_fcs)
+    max_fc = float(max_crossover_hz) if max_crossover_hz is not None else max(candidate_fcs)
+    best_fc = float(best["crossover_hz"])
+    at_boundary = best_fc <= min_fc + boundary_margin_hz or best_fc >= max_fc - boundary_margin_hz
+    if at_boundary and boundary_reluctance_db > 0.0:
+        interior_rows = [
+            row for row in exact_sorted
+            if min_fc + boundary_margin_hz < float(row["crossover_hz"]) < max_fc - boundary_margin_hz
+            and float(row["exact_score"]) <= float(best["exact_score"]) + boundary_reluctance_db
+        ]
+        if interior_rows:
+            boundary_best = best
+            best = dict(interior_rows[0])
+            best["boundary_rejection_hz"] = float(boundary_best["crossover_hz"])
+            best["boundary_rejection_exact_score"] = float(boundary_best["exact_score"])
+            best["boundary_reluctance_db"] = float(boundary_reluctance_db)
     best["top_candidates"] = sorted(exact_rows, key=lambda row: row["exact_score"])
     best["exact_candidate_limit"] = int(max_candidates)
     best["exact_candidates_scored"] = len(exact_rows)
@@ -2307,6 +2366,9 @@ def crossover_selection_metadata(crossover: Dict[str, float]) -> Dict[str, objec
         "proxy_score",
         "exact_score",
         "score",
+        "boundary_rejection_hz",
+        "boundary_rejection_exact_score",
+        "boundary_reluctance_db",
     )
     selected = {key: crossover[key] for key in selected_keys if key in crossover}
     return {
@@ -2336,6 +2398,30 @@ def correction_band_metadata(freq: np.ndarray, masks: Dict[str, np.ndarray]) -> 
         else:
             bands[key] = {"low_hz": 0.0, "high_hz": 0.0}
     return bands
+
+
+def peq_seed_settings(channel_key: str) -> Dict[str, float]:
+    if channel_key in {"left", "right"}:
+        return {
+            "max_filters": 8.0,
+            "min_error_db": 1.0,
+            "cut_gain_factor": 0.8,
+            "boost_gain_factor": 0.45,
+            "prune_max_rms_worsening_db": 0.0,
+            "cumulative_boost_cap_db": 8.0,
+            "remove_level_offset": 1.0,
+            "prefer_seed_if_within_db": 1.0,
+        }
+    return {
+        "max_filters": float(MAX_PEQ_FILTERS),
+        "min_error_db": 2.0,
+        "cut_gain_factor": 0.75,
+        "boost_gain_factor": 0.35,
+        "prune_max_rms_worsening_db": 0.2,
+        "cumulative_boost_cap_db": 5.0,
+        "remove_level_offset": 0.0,
+        "prefer_seed_if_within_db": 0.0,
+    }
 
 
 def build_final_filter_system(
@@ -2391,20 +2477,29 @@ def build_final_filter_system(
         frontier_disabled_reason = ""
         for key, title in [("left", "Left"), ("right", "Right"), ("sub", "Sub")]:
             base = avg[key] * xover[key] * 10.0 ** (current_gains[key] / 20.0)
-            peq_boost_cap = boost_cap_curve_db(freq, distortion, key, default_boost_db=3.0)
+            peq_boost_cap = (
+                boost_cap_curve_db(freq, distortion, key, default_boost_db=3.0)
+                if key == "sub"
+                else None
+            )
             fir_boost_cap = boost_cap_curve_db(
                 freq,
                 distortion,
                 key,
                 default_boost_db=fir_ls_max_boost_db if fir_method == "ls" else 3.0,
             )
+            seed_settings = peq_seed_settings(key)
             seed = seed_peak_filters(
                 freq,
                 base,
                 target_db,
                 masks[key],
-                MAX_PEQ_FILTERS,
+                int(seed_settings["max_filters"]),
                 boost_cap_db=peq_boost_cap,
+                min_error_db=seed_settings["min_error_db"],
+                cut_gain_factor=seed_settings["cut_gain_factor"],
+                boost_gain_factor=seed_settings["boost_gain_factor"],
+                remove_level_offset=bool(seed_settings["remove_level_offset"]),
             )
             peq_result = optimize_peak_filters(
                 freq,
@@ -2414,7 +2509,31 @@ def build_final_filter_system(
                 seed,
                 distortion,
                 boost_cap_db=peq_boost_cap,
+                peq_cumulative_boost_cap_db=seed_settings["cumulative_boost_cap_db"],
+                prune_max_rms_worsening_db=seed_settings["prune_max_rms_worsening_db"],
+                remove_level_offset=bool(seed_settings["remove_level_offset"]),
+                prefer_seed_if_within_db=seed_settings["prefer_seed_if_within_db"],
             )
+            if key in {"left", "right"} and len(peq_result.filters) < 3 and len(seed) >= 3:
+                optimized_rms = channel_rms_error(
+                    base * cascade_response(peq_result.filters, freq),
+                    target_db,
+                    masks[key],
+                )
+                seed_rms_actual = channel_rms_error(
+                    base * cascade_response(seed, freq),
+                    target_db,
+                    masks[key],
+                )
+                if seed_rms_actual <= optimized_rms + 3.0:
+                    peq_result = PeqOptimizationResult(
+                        filters=seed,
+                        seed_rms_db=peq_result.seed_rms_db,
+                        refined_rms_db=seed_rms_actual,
+                        success=peq_result.success,
+                        message=str(peq_result.message) + "; retained richer main PEQ seed.",
+                        nfev=peq_result.nfev,
+                    )
             peq = peq_result.filters
             peq_resp = cascade_response(peq, freq)
             after_peq = base * peq_resp
@@ -2549,7 +2668,7 @@ def build_final_filter_system(
                     key=key,
                     title=title,
                     peq=peq,
-                    peq_optimization=peq_optimization_metadata(peq_result),
+                    peq_optimization=peq_optimization_metadata(peq_result, seed_settings),
                     fir=fir,
                     gain_db=current_gains[key],
                     delay_ms=delays[key],
@@ -3096,7 +3215,7 @@ def main() -> int:
         help="REW target text file. Defaults to 'Harman Audio Test System Target.txt'.",
     )
     parser.add_argument("--min-crossover", type=int, default=50)
-    parser.add_argument("--max-crossover", type=int, default=140)
+    parser.add_argument("--max-crossover", type=int, default=180)
     parser.add_argument(
         "--prefer-crossover",
         type=float,
@@ -3415,6 +3534,8 @@ def main() -> int:
         proxy_crossover["top_candidates"],
         exact_scorer=exact_scorer,
         max_candidates=args.exact_candidates,
+        min_crossover_hz=args.min_crossover,
+        max_crossover_hz=args.max_crossover,
     )
     selected_key = candidate_cache_key(crossover)
     selected_system = system_cache[selected_key]

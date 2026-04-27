@@ -80,6 +80,52 @@ class GenerateMiniDSPFiltersTests(unittest.TestCase):
             np.asarray([True, True, True, True, False, False, False, False]),
         )
 
+    def test_main_peq_seed_settings_use_multiple_filters_for_multiple_residuals(self):
+        freq = np.geomspace(140.0, 18_000.0, 700)
+        target = np.zeros_like(freq)
+        response = (
+            np.ones_like(freq, dtype=np.complex128) * (10.0 ** (-6.0 / 20.0))
+            * gen.biquad_peak(300.0, 3.0, 2.0).response(freq)
+            * gen.biquad_peak(900.0, -2.0, 2.5).response(freq)
+            * gen.biquad_peak(2600.0, 2.5, 3.0).response(freq)
+        )
+        mask = np.ones_like(freq, dtype=bool)
+
+        filters = gen.seed_peak_filters(
+            freq,
+            response,
+            target,
+            mask,
+            max_filters=8,
+            min_error_db=1.0,
+            remove_level_offset=True,
+        )
+
+        self.assertGreaterEqual(len(filters), 3)
+
+    def test_exact_crossover_selection_avoids_boundary_when_nearly_tied(self):
+        candidates = [
+            {"score": 1.0, "crossover_hz": 132.0, "sub_delay_ms": 0.0, "sub_gain_db": 0.0},
+            {"score": 0.9, "crossover_hz": 140.0, "sub_delay_ms": 0.0, "sub_gain_db": 0.0},
+        ]
+
+        def scorer(candidate):
+            if candidate["crossover_hz"] == 140.0:
+                return {"score": 5.0}
+            return {"score": 5.08}
+
+        selected = gen.select_exact_crossover_candidate(
+            candidates,
+            exact_scorer=scorer,
+            max_candidates=2,
+            boundary_reluctance_db=0.1,
+            min_crossover_hz=50.0,
+            max_crossover_hz=140.0,
+        )
+
+        self.assertEqual(selected["crossover_hz"], 132.0)
+        self.assertEqual(selected["boundary_rejection_hz"], 140.0)
+
     def test_multipoint_dataset_preserves_positions_and_provides_average(self):
         freq = np.asarray([100.0, 200.0])
         responses = {
