@@ -34,6 +34,7 @@ FRONTIER_EXTRA_CONSTRAINTS_PER_ITERATION = 8
 FRONTIER_IMMEDIATE_REJECTION_OVER_CAP_DB = 6.0
 FRONTIER_MAX_EFFECTIVE_TAPS = 64
 FRONTIER_MIN_DENSE_CONSTRAINT_POINTS = 384
+FRONTIER_OUT_OF_BAND_FLATNESS_TOLERANCE_DB = 0.75
 
 
 @dataclass
@@ -1485,6 +1486,8 @@ def dense_fir_guardrail_metrics(
             "dense_max_boost_db": 0.0,
             "dense_max_boost_hz": 0.0,
             "dense_boost_over_cap_db": 0.0,
+            "dense_out_of_band_max_abs_db": 0.0,
+            "dense_out_of_band_max_abs_hz": 0.0,
             "dense_guardrail_pass": True,
         }
 
@@ -1497,12 +1500,26 @@ def dense_fir_guardrail_metrics(
     max_idx = int(active_indices[int(np.argmax(active_boost))])
     over_idx = int(active_indices[int(np.argmax(active_over_cap))])
     max_over = float(active_over_cap[int(np.argmax(active_over_cap))])
+    inactive_indices = np.flatnonzero(~active)
+    if inactive_indices.size:
+        inactive_abs = np.abs(response_db[inactive_indices])
+        inactive_idx = int(inactive_indices[int(np.argmax(inactive_abs))])
+        out_of_band_max_abs = float(response_db[inactive_idx])
+        out_of_band_max_abs_hz = float(freq[inactive_idx])
+        out_of_band_pass = abs(out_of_band_max_abs) <= FRONTIER_OUT_OF_BAND_FLATNESS_TOLERANCE_DB
+    else:
+        out_of_band_max_abs = 0.0
+        out_of_band_max_abs_hz = 0.0
+        out_of_band_pass = True
     return {
         "dense_max_boost_db": float(response_db[max_idx]),
         "dense_max_boost_hz": float(freq[max_idx]),
         "dense_boost_over_cap_db": max_over,
         "dense_boost_over_cap_hz": float(freq[over_idx]),
-        "dense_guardrail_pass": bool(max_over <= tolerance_db),
+        "dense_out_of_band_max_abs_db": out_of_band_max_abs,
+        "dense_out_of_band_max_abs_hz": out_of_band_max_abs_hz,
+        "dense_out_of_band_flatness_tolerance_db": FRONTIER_OUT_OF_BAND_FLATNESS_TOLERANCE_DB,
+        "dense_guardrail_pass": bool(max_over <= tolerance_db and out_of_band_pass),
     }
 
 
@@ -1614,6 +1631,10 @@ def make_frontier_fir(
             else np.zeros(constraint_freq.shape, dtype=np.complex128)
         )
         delay_phase = np.exp(-1j * 2.0 * np.pi * design_freq * (delay_samples / fs))
+        constraint_delay_phase = np.exp(-1j * 2.0 * np.pi * constraint_freq * (delay_samples / fs))
+        constraint_active = (
+            np.interp(constraint_freq, freq, correction_mask.astype(np.float64), left=0.0, right=0.0) >= 0.5
+        )
         h = cp.Variable(effective_taps)
 
         residual_terms = []
@@ -1640,6 +1661,17 @@ def make_frontier_fir(
             cp.abs(base_constraint_response[constraint_rows] + constraint_fourier[constraint_rows] @ h)
             <= max_gain[constraint_rows]
         )
+        inactive_rows = np.flatnonzero(~constraint_active)
+        if inactive_rows.size:
+            flatness_tolerance = 10.0 ** (FRONTIER_OUT_OF_BAND_FLATNESS_TOLERANCE_DB / 20.0) - 1.0
+            constraints.append(
+                cp.abs(
+                    base_constraint_response[inactive_rows]
+                    + constraint_fourier[inactive_rows] @ h
+                    - constraint_delay_phase[inactive_rows]
+                )
+                <= flatness_tolerance
+            )
         constraints.append(cp.norm2(h) <= 10.0 ** (float(max_filter_energy_db) / 20.0))
         centre = taps // 2
         pre_limit = 10.0 ** (float(pre_ringing_limit_db) / 20.0)
@@ -1663,7 +1695,7 @@ def make_frontier_fir(
                 "status": "clarabel_failed",
                 "objective": float("inf"),
                 "positions": float(len(measured_positions)),
-                "constraints": "boost_cap,energy,pre_ringing,dense_guardrail",
+                "constraints": "boost_cap,energy,pre_ringing,dense_guardrail,out_of_band_flatness",
                 "clarabel_error": clarabel_error,
                 "design_points_used": float(design_freq.size),
                 "dense_constraint_points_used": float(constraint_freq.size),
@@ -1678,7 +1710,7 @@ def make_frontier_fir(
             "status": str(problem.status),
             "objective": float(problem.value),
             "positions": float(len(measured_positions)),
-            "constraints": "boost_cap,energy,pre_ringing,dense_guardrail",
+            "constraints": "boost_cap,energy,pre_ringing,dense_guardrail,out_of_band_flatness",
             "clarabel_error": clarabel_error,
             "design_points_used": float(design_freq.size),
             "dense_constraint_points_used": float(constraint_freq.size),
@@ -3001,11 +3033,15 @@ def build_report(
             max_boost = float(metrics.get("dense_max_boost_db", 0.0))
             max_boost_hz = float(metrics.get("dense_max_boost_hz", 0.0))
             over_cap = float(metrics.get("dense_boost_over_cap_db", 0.0))
+            out_of_band = float(metrics.get("dense_out_of_band_max_abs_db", 0.0))
+            out_of_band_hz = float(metrics.get("dense_out_of_band_max_abs_hz", 0.0))
             refinements = float(metrics.get("safety_refinement_iterations", 0.0))
             detail = (
                 f"- {result.title} frontier accepted: {accepted}; solver status {status}; "
                 f"dense max FIR boost {max_boost:+.2f} dB at {max_boost_hz:.1f} Hz; "
-                f"dense boost over cap {over_cap:+.2f} dB; safety refinements {refinements:.0f}"
+                f"dense boost over cap {over_cap:+.2f} dB; "
+                f"out-of-band FIR deviation {out_of_band:+.2f} dB at {out_of_band_hz:.1f} Hz; "
+                f"safety refinements {refinements:.0f}"
             )
             if reason:
                 detail += f"; rejection reason: {reason}"

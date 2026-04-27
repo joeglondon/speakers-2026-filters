@@ -297,6 +297,17 @@ class GenerateMiniDSPFiltersTests(unittest.TestCase):
         self.assertGreater(metrics["dense_boost_over_cap_db"], 6.0)
         self.assertAlmostEqual(metrics["dense_max_boost_hz"], center_hz, delta=5.0)
 
+    def test_frontier_dense_guardrail_rejects_out_of_band_fir_comb_filtering(self):
+        freq = np.geomspace(20.0, 20_000.0, 1200)
+        mask = freq <= 140.0
+        fir = np.ones(8, dtype=np.float64) / 8.0
+
+        metrics = gen.dense_fir_guardrail_metrics(freq, fir, mask, max_boost_db=3.0)
+
+        self.assertFalse(metrics["dense_guardrail_pass"])
+        self.assertGreater(abs(metrics["dense_out_of_band_max_abs_db"]), 0.75)
+        self.assertGreater(metrics["dense_out_of_band_max_abs_hz"], 140.0)
+
     def test_frontier_fallback_uses_legacy_when_frontier_worsens_channel_rms(self):
         freq = np.asarray([100.0, 200.0, 400.0])
         target_db = np.zeros_like(freq)

@@ -5,14 +5,14 @@ Left: Input 1
 Right: Input 2
 Sub: Input 1 + Input 2
 
-Crossover: LR4 / 24 dB/oct at 140 Hz
+Crossover: LR4 / 24 dB/oct at 166 Hz
 Sub high-pass: none
 Sub correction lower limit: 15 Hz
 
 Output trims:
-Left: delay 7.202 ms, gain -9.212 dB
-Right: delay 7.202 ms, gain -10.096 dB
-Sub: delay 0.000 ms, gain +3.756 dB
+Left: delay 8.302 ms, gain -9.221 dB
+Right: delay 8.302 ms, gain -10.096 dB
+Sub: delay 0.000 ms, gain +2.911 dB
 
 FIR group delay compensation:
 Sub FIR group delay is 10.620 ms.
@@ -20,9 +20,9 @@ Left/Right FIR group delay is 5.318 ms.
 The output delays above include this difference.
 FIR requested: frontier constrained multipoint CVXPY
 FIR used:
-Left: frontier cvxpy
-Right: frontier cvxpy
-Sub: frontier cvxpy
+Left: legacy fallback
+Right: legacy fallback
+Sub: flat guardrail fallback
 
 FIR imports:
 File Mode binary:
